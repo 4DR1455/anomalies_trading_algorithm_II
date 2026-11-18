@@ -1,0 +1,28 @@
+# Environment & API secrets
+.env
+.env.*
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Rust / Cargo build artifacts
+target/
+**/*.rs.bk
+
+# Runtime trading data & telemetry
+data/telemetry.json
+data/*.tmp
+data/*.json.tmp
+
+# Logs & backups
+.backups/
+*.log
+.DS_Store

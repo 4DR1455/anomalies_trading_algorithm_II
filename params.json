@@ -1,0 +1,16 @@
+{
+  "symbol": "SOL/USD",
+  "level": 2.0,
+  "max_shares": 2,
+  "min_margin": 0.0015,
+  "max_margin": 0.0250,
+  "cycle_seconds": 30,
+  "hidden_mm_timeout_seconds": 20,
+  "stale_order_max_age_seconds": 43200,
+  "kalman": {
+    "q_base": 1.5e-7,
+    "r_base": 4.0e-7,
+    "spread_weight": 2.0,
+    "adapt_lambda": 0.20
+  }
+}
