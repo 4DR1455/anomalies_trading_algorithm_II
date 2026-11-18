@@ -1,9 +1,10 @@
 # Mean Reversion Trading System with Adaptive Kalman Filtering & Asymptotic Capital Allocation (v2.0)
 
-[![Live Dashboard](https://img.shields.io/badge/Live%20Dashboard-Online%20(HTTPS)-success?style=for-the-badge&logo=googlechrome&logoColor=white)](https://adria-trading-bot.duckdns.org/)
-[![Status](https://img.shields.io/badge/Engine%20Status-Operating%2024%2F7-brightgreen?style=for-the-badge)](https://adria-trading-bot.duckdns.org/)
-[![SSL](https://img.shields.io/badge/Security-Let's%20Encrypt%20SSL-blue?style=for-the-badge&logo=letsencrypt)](https://adria-trading-bot.duckdns.org/)
-[![Asset](https://img.shields.io/badge/Trading%20Pair-SOL%2FUSD-purple?style=for-the-badge&logo=solana)](https://adria-trading-bot.duckdns.org/)
+<div align="center">
+
+[![Online Dashboard](https://img.shields.io/badge/ONLINE%20DASHBOARD-24%2F7%20LIVE%20%E2%80%A2%20HTTPS%20SSL%20%E2%80%A2%20SOL%2FUSD%20REAL--TIME%20TELEMETRY%20%E2%80%A2%20STATUS%3A%20ACTIVE-00C853?style=for-the-badge&logo=googlechrome&logoColor=white)](https://adria-trading-bot.duckdns.org/)
+
+</div>
 
 > ### 🌐 Live Quantitative Dashboard (Real-Time Telemetry)
 > **Access the live, autonomous trading bot operating 24/7 on Alpaca Paper Trading:**  
@@ -12,25 +13,24 @@
 
 ---
 
-
 ## 🏗 System Architecture
 
 The v2.0 system follows a strict "Separation of Concerns" principle to maximize runtime resilience, eliminate IPC fragility, and guarantee zero crashes.
 
 ```mermaid
-graph TD
-    A[Alpaca Markets API<br/>REST v2 & v1beta3] <-->|HTTPS / Pure TLS| B(Unified Trading Engine<br/>Async / Memory Safe);
+flowchart TD
+    A["Alpaca Markets API<br/>REST v2 & v1beta3"] <-->|HTTPS / Pure TLS| B["Unified Trading Engine<br/>Async / Memory Safe"]
     
-    subgraph Engine Core (adria user)
-        B <--> C{Strategy Brain<br/>Adaptive 1D Kalman Filter};
-        B <--> H[Order Execution & Hygiene<br/>HiddenMM + 12h Stale Liquidation];
-        B -->|Atomic fsync + replace| S[(State & Telemetry Store<br/>data/telemetry.json)];
+    subgraph EngineCore ["Engine Core (adria user)"]
+        B <--> C{"Strategy Brain<br/>Adaptive 1D Kalman Filter"}
+        B <--> H["Order Execution & Hygiene<br/>HiddenMM + 12h Stale Liquidation"]
+        B -->|Atomic fsync + replace| S[("State & Telemetry Store<br/>data/telemetry.json")]
     end
 
-    S -->|Read-Only Bind Mount| D[Unprivileged Web Backend<br/>Waitress WSGI / traderweb user];
-    D <-->|Internal HTTP / 127.0.0.1:8080| E[Hardened Nginx Reverse Proxy<br/>Ports 80 & 443 + Let's Encrypt SSL];
-    E <-->|HTTPS / HTTP2| F[Public Web Dashboard<br/>adria-trading-bot.duckdns.org];
-    G[params.json] -.->|Dynamic Hyperparameters| B;
+    S -->|Read-Only Bind Mount| D["Unprivileged Web Backend<br/>Waitress WSGI / traderweb user"]
+    D <-->|Internal HTTP / 127.0.0.1:8080| E["Hardened Nginx Reverse Proxy<br/>Ports 80 & 443 + Let's Encrypt SSL"]
+    E <-->|HTTPS / HTTP2| F["Public Web Dashboard<br/>adria-trading-bot.duckdns.org"]
+    G["params.json"] -.->|Dynamic Hyperparameters| B
 
     style B fill:#e65c00,stroke:#333,stroke-width:2px,color:white
     style C fill:#2b5c8f,stroke:#333,stroke-width:2px,color:white
@@ -101,33 +101,33 @@ $$SharesAmount(x) = Max \times \left(1 - (1 - x^{level})^{\frac{1}{level}}\right
 ### Algorithm Flow Diagram
 
 ```mermaid
-graph TD
-    A([Start 30s Cycle]) --> B[Fetch Latest Market Quote Bid / Ask];
-    B --> C[Update Adaptive 1D Kalman Filter];
-    C --> D{Anomaly Ratio mt > max_margin?};
+flowchart TD
+    A(["Start 30s Cycle"]) --> B["Fetch Latest Market Quote (Bid / Ask)"]
+    B --> C["Update Adaptive 1D Kalman Filter"]
+    C --> D{"Anomaly Ratio mt > max_margin?"}
     
-    D -- Yes --> CB[🚨 CIRCUIT BREAKER: Halt Entries & Damp Filter];
-    CB --> H[Run 12h Stale Order Hygiene];
+    D -- "Yes" --> CB["🚨 CIRCUIT BREAKER: Halt Entries & Damp Filter"]
+    CB --> H["Run 12h Stale Order Hygiene"]
     
-    D -- No --> E{Undervaluation mt >= min_margin?};
-    E -- No --> H;
-    E -- Yes --> F[Calculate Shares via Asymptotic Formula];
+    D -- "No" --> E{"Undervaluation mt >= min_margin?"}
+    E -- "No" --> H
+    E -- "Yes" --> F["Calculate Shares via Asymptotic Formula"]
     
-    F --> G[Calculate Legal HiddenMM Buy Price];
-    G --> I[Submit Limit BUY Order with Maker Priority];
-    I --> J[Wait up to 20s for Fill];
+    F --> G["Calculate Legal HiddenMM Buy Price"]
+    G --> I["Submit Limit BUY Order with Maker Priority"]
+    I --> J["Wait up to 20s for Fill"]
     
-    J -- Filled or Partial --> K[Submit Exit Limit SELL at Predicted Fair Price];
-    J -- 20s Timeout --> L[Cancel Unfilled Remainder];
-    L --> K;
+    J -- "Filled or Partial" --> K["Submit Exit Limit SELL at Predicted Fair Price"]
+    J -- "20s Timeout" --> L["Cancel Unfilled Remainder"]
+    L --> K
     
-    K --> H;
-    H --> S[Atomic State & Telemetry Save];
-    S --> W([Wait for Next 30s Window]);
-    W --> A;
+    K --> H
+    H --> S["Atomic State & Telemetry Save"]
+    S --> W(["Wait for Next 30s Window"])
+    W --> A
 
-    style A fill:#69f,stroke:#333,stroke-width:2px,color:white
-    style B fill:#69f,stroke:#333,stroke-width:2px,color:white
+    style A fill:#4a86e8,stroke:#333,stroke-width:2px,color:white
+    style B fill:#4a86e8,stroke:#333,stroke-width:2px,color:white
     style C fill:#2b5c8f,stroke:#333,stroke-width:2px,color:white
     style CB fill:#ef4444,stroke:#333,stroke-width:2px,color:white
     style G fill:#28a745,stroke:#333,stroke-width:2px,color:white
@@ -323,12 +323,13 @@ This system was engineered from inception to production using a collaborative **
 
 ```mermaid
 flowchart TD
-    Spec["1. Strategic Specification & Directives<br/>prompt engineering/SPECIFICATION.md"] --> Agent1["Agent 1: Quantitative Researcher<br/>• 30s Stochastic Model Selection (Kalman vs OU vs EMA)<br/>• SEC Rule 612 Sub-Penny Tick Compliance<br/>• Unified Zero-Crash Architecture Evaluation"];
-    Spec --> Agent2["Agent 2: DevOps & Security Architect<br/>• Systemd Process Sandboxing (traderweb & adria)<br/>• Nginx Edge Defense & Rate Limiting (10r/s)<br/>• Let's Encrypt SSL & DuckDNS Orchestration"];
-    Agent1 --> Core["Production Engine & Math Implementation<br/>• Rust Core + Python Live Runner<br/>• HiddenMM Queue Priority & Partial Fill Recovery<br/>• 10/10 Test Suite Coverage"];
-    Agent2 --> Cloud["Cloud Deployment & Hardened Public Edge<br/>• 24/7 Autonomous Service Daemons<br/>• Read-Only Kernel Bind Mount Isolation<br/>• HTTPS Public Telemetry Dashboard"];
-    Core --> Live["24/7 Live Alpaca Paper Trading<br/>https://adria-trading-bot.duckdns.org/"];
-    Cloud --> Live;
+    Spec["1. Strategic Specification & Directives<br/>prompt engineering/SPECIFICATION.md"] --> Agent1["Agent 1: Quantitative Researcher<br/>- 30s Stochastic Model Selection (Kalman vs OU vs EMA)<br/>- SEC Rule 612 Sub-Penny Tick Compliance<br/>- Unified Zero-Crash Architecture Evaluation"]
+    Spec --> Agent2["Agent 2: DevOps & Security Architect<br/>- Systemd Process Sandboxing (traderweb & adria)<br/>- Nginx Edge Defense & Rate Limiting (10r/s)<br/>- Let's Encrypt SSL & DuckDNS Orchestration"]
+    Agent1 --> Core["Production Engine & Math Implementation<br/>- Rust Core + Python Live Runner<br/>- HiddenMM Queue Priority & Partial Fill Recovery<br/>- 10/10 Test Suite Coverage"]
+    Agent2 --> Cloud["Cloud Deployment & Hardened Public Edge<br/>- 24/7 Autonomous Service Daemons<br/>- Read-Only Kernel Bind Mount Isolation<br/>- HTTPS Public Telemetry Dashboard"]
+    Core --> Live["24/7 Live Alpaca Paper Trading<br/>https://adria-trading-bot.duckdns.org/"]
+    Cloud --> Live
+
 
     style Spec fill:#2b5c8f,stroke:#333,stroke-width:2px,color:white
     style Agent1 fill:#e65c00,stroke:#333,stroke-width:2px,color:white
