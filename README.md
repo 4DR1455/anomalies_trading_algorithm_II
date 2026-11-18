@@ -59,6 +59,7 @@ flowchart TD
 * **Analytics Dashboard (Python 3 + NumPy):**
   * Reads real-time telemetry snapshots without exposing network ports to the public internet.
   * Calculates **Sharpe Ratio**, **Max Drawdown**, **Volatility**, **Win Rate**, and **P&L** on historical and live trades.
+  * **Zero-Reset Web Persistence:** Historical trades and computed metrics persist across browser refreshes, web template modifications, and daemon restarts without starting over.
   * Bound strictly to `127.0.0.1:8080`.
 
 ---
