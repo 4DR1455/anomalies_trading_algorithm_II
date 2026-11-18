@@ -69,24 +69,20 @@ flowchart TD
 
 Every 30 seconds, the engine queries the latest National Best Bid and Offer (NBBO) quote $(B_t, A_t)$, computes mid-price $z_t = \frac{1}{2}(B_t + A_t)$, and updates the Kalman state:
 
-1. **Prior Prediction:**
-   $$\hat{x}_{t|t-1} = \hat{x}_{t-1|t-1}, \qquad P_{t|t-1} = P_{t-1|t-1} + Q_{t-1}$$
-2. **Spread-Adaptive Measurement Noise:**
-   $$R_t = r_{\text{base}} \cdot z_t^2 + \gamma_s \left(\frac{A_t - B_t}{2}\right)^2$$
-3. **Innovation & Mispricing Ratio:**
-   $$\nu_t = z_t - \hat{x}_{t|t-1}, \qquad m_t = \frac{\hat{x}_{t|t-1} - z_t}{\hat{x}_{t|t-1}}$$
+1. **Prior Prediction:** $\hat{x}_{t|t-1} = \hat{x}_{t-1|t-1}, \quad P_{t|t-1} = P_{t-1|t-1} + Q_{t-1}$
+2. **Spread-Adaptive Measurement Noise:** $R_t = r_{\text{base}} \cdot z_t^2 + \gamma_s \left(\frac{A_t - B_t}{2}\right)^2$
+3. **Innovation & Mispricing Ratio:** $\nu_t = z_t - \hat{x}_{t|t-1}, \quad m_t = \frac{\hat{x}_{t|t-1} - z_t}{\hat{x}_{t|t-1}}$
 
 ### 2. Thresholding & Circuit Breaker
 
 * **Buy Signal:** Triggered when $m_t \ge m_{\min}$ (where $m_{\min}$ is `min_margin`, undervaluation anomaly detected).
-* **Circuit Breaker / Volatility Ceiling (`max_margin`):**
-  If $m_t > m_{\max}$ (where $m_{\max}$ is `max_margin`, e.g., flash crash or news dump), **trading halts immediately**. The state update is heavily gated to prevent poisoning the filter with extreme anomalies.
+* **Circuit Breaker / Volatility Ceiling (`max_margin`):** If $m_t > m_{\max}$ (where $m_{\max}$ is `max_margin`, e.g., flash crash or news dump), **trading halts immediately**. The state update is heavily gated to prevent poisoning the filter with extreme anomalies.
 
 ### 3. Dynamic Position Sizing & Portfolio Equity Allocation
 
 Instead of arbitrary fixed share lots, capital allocation scales dynamically as a proportion of total portfolio equity $W_t$, governed by the normalized anomaly factor and execution liquidity constraints:
 
-$$\text{Factor}(x) = 1 - (1 - x^{level})^{\frac{1}{level}}$$
+$$\text{Factor}(x) = 1 - \left(1 - x^{\text{level}}\right)^{\frac{1}{\text{level}}}$$
 
 $$\text{Target Capital} = \text{Factor}(x) \times (W_t \times S)$$
 
@@ -95,8 +91,7 @@ $$\text{Allocated Capital} = \min(\text{Target Capital}, \; \text{Available Cash
 $$\text{Shares / Units} = \mathrm{round}\left(\frac{\text{Allocated Capital}}{P_{\text{buy}}}, \; 4\right)$$
 
 *Where:*
-* $x$: Normalized deviation ratio scaled between `min_margin` ($m_{\min}$) and `max_margin` ($m_{\max}$):
-  $$x = \mathrm{clamp}\left(\frac{m_t - m_{\min}}{m_{\max} - m_{\min}},\, 0,\, 1\right)$$
+* $x$: Normalized deviation ratio scaled between `min_margin` ($m_{\min}$) and `max_margin` ($m_{\max}$): $x = \mathrm{clamp}\left(\frac{m_t - m_{\min}}{m_{\max} - m_{\min}},\, 0,\, 1\right)$.
 * $S$: Maximum equity proportion parameter (`max_shares` $\in (0, 1.0]$). For example, $S = 0.20$ limits any single trade to at most 20% of total portfolio equity, while $S = 1.0$ authorizes up to 100% of available capital when no other positions are active.
 * $W_t$: Real-time portfolio equity reported by Alpaca (`client.get_account().equity`).
 * $\text{Available Cash}$: Cash currently idle in the account. To prevent unphysical asymptotic lockups, if remaining cash is less than the calculated target capital, the algorithm directly deploys all available remaining cash: $\min(\text{Target Capital}, \; \text{Cash})$.
@@ -110,35 +105,32 @@ To determine the mathematically optimal value for `max_shares` ($S$), the live p
 
 * **Production Observation Sample:** $N_{\text{cycles}} = 484$ consecutive 30-second cycles ($4.03$ hours).
 * **Empirical Anomaly Count:** $N_{\text{anomalies}} = 50$ market hunt undervaluation anomalies detected.
-* **Anomaly Probability per Cycle:**
-  $$p = \frac{50}{484} = 0.10331 \quad (10.33\% \text{ per 30s cycle})$$
-  *(An anomaly recurs on average once every $9.68$ cycles $\approx 290.4$ seconds $\approx 4.84$ minutes).*
+* **Anomaly Probability per Cycle:** $p = \frac{50}{484} = 0.10331$ ($10.33\%$ per 30s cycle, recurring once every $9.68$ cycles $\approx 290.4$s $\approx 4.84$ min).
 * **Maker Order Fill Rate (20s timeout):** $P_{\text{fill}} = \frac{26}{50} = 52.0\%$.
 * **Mean Realized Return per Trade:** $\bar{r} = +0.2358\%$ ($+0.002358$).
-* **Average Position Hold Duration:** $\bar{\tau} = 15.81$ cycles ($474.4$ seconds $\approx 7.91$ minutes) until fair-price exit fill.
-* **Little's Law Queue Load:**
-  $$L = \lambda \cdot \bar{\tau} = (p \cdot P_{\text{fill}}) \cdot \bar{\tau} = (0.10331 \times 0.520) \times 15.81 \approx 0.8493 \text{ concurrent open trades}$$
+* **Average Position Hold Duration:** $\bar{\tau} = 15.81$ cycles ($474.4$s $\approx 7.91$ min) until fair-price exit fill.
+* **Little's Law Queue Load:** $L = \lambda \cdot \bar{\tau} = (p \cdot P_{\text{fill}}) \cdot \bar{\tau} = (0.10331 \times 0.520) \times 15.81 \approx 0.8493$ concurrent open trades.
 
 #### 3-Hour Expected Profit Equation ($\mathbb{E}[\Pi(S)]$)
 
-Over a 3-hour trading horizon ($T = 360$ cycles of 30 seconds), the engine encounters on average $360 \times 0.10331 \times 0.520 \approx 19.34$ completed trades. Given account equity $W_0 = \$100,000$ and concurrent trade distribution following a Poisson queue $P(K = k) = \frac{L^k e^{-L}}{k!}$, the expected dollar return as a function of `max_shares` proportion $S$ is:
+Over a 3-hour trading horizon ($T = 360$ cycles of 30 seconds), the engine encounters on average $360 \times 0.10331 \times 0.520 \approx 19.34$ completed trades. Given account equity $W_0 = 100,000\text{ USD}$ and concurrent trade distribution following a Poisson queue $P(K = k) = \frac{L^k e^{-L}}{k!}$, the expected dollar return as a function of `max_shares` proportion $S$ is:
 
 $$\mathbb{E}[\Pi(S)] = T \cdot p \cdot P_{\text{fill}} \cdot \bar{r} \cdot W_0 \sum_{k=0}^{\infty} \frac{L^k e^{-L}}{k!} \min\big(S, \; \max(0, 1 - k S)\big)$$
 
 #### Profit Sensitivity & Concurrency Table
 
-| `max_shares` ($S$) | Strategy Profile | Concurrency Slots | Anomaly Capacity Covered | Expected 3-Hour Profit ($W_0 = \$100\text{k}$) |
+| `max_shares` ($S$) | Strategy Profile | Concurrency Slots | Anomaly Capacity Covered | Expected 3-Hour Profit ($W_0 = 100\text{k}$ USD) |
 |:---|:---|:---:|:---:|:---:|
-| **`0.05`** | Hyper-conservative | 20 slots | 100.0% | \$228.00 |
-| **`0.10`** | Conservative | 10 slots | 100.0% | \$456.00 |
-| **`0.20`** | Moderate Portfolio | 5 slots | 99.8% | \$910.78 |
-| **`0.33`** | Aggressive Growth | 3 slots | 95.6% | \$1,436.22 |
-| **`0.50`** | Balanced 2-Slot | 2 slots | 84.0% | \$1,804.31 |
-| **`1.00`** | **Optimal Profit Maximizer** | **1 slot (Full Cash)** | **42.8%** | **\$1,951.35** |
+| **`0.05`** | Hyper-conservative | 20 slots | 100.0% | +228.00 USD |
+| **`0.10`** | Conservative | 10 slots | 100.0% | +456.00 USD |
+| **`0.20`** | Moderate Portfolio | 5 slots | 99.8% | +910.78 USD |
+| **`0.33`** | Aggressive Growth | 3 slots | 95.6% | +1,436.22 USD |
+| **`0.50`** | Balanced 2-Slot | 2 slots | 84.0% | +1,804.31 USD |
+| **`1.00`** | **Optimal Profit Maximizer** | **1 slot (Full Cash)** | **42.8%** | **+1,951.35 USD** |
 
 > [!TIP]
 > **Key Optimization Insight:**
-> Because the mean system queue load $L = 0.849$ is less than 1 concurrent trade, sitting on idle cash in order to guarantee room for overlapping anomalies produces a large opportunity cost. Committing 100% of available cash on every filled signal ($S^* = 1.0$) maximizes total expected dollar profit (**\$1,951.35** per 3 hours). For traders seeking higher trade-level diversification with 2 concurrent slots, $S = 0.50$ captures 84% of all overlapping opportunities while generating **\$1,804.31** (92.5% of maximum profit).
+> Because the mean system queue load $L = 0.849$ is less than 1 concurrent trade, sitting on idle cash in order to guarantee room for overlapping anomalies produces a large opportunity cost. Committing 100% of available cash on every filled signal ($S^* = 1.0$) maximizes total expected dollar profit (**+1,951.35 USD** per 3 hours). For traders seeking higher trade-level diversification with 2 concurrent slots, $S = 0.50$ captures 84% of all overlapping opportunities while generating **+1,804.31 USD** (92.5% of maximum profit).
 
 ### Algorithm Flow Diagram
 
