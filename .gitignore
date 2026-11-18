@@ -19,6 +19,9 @@ target/
 
 # Runtime trading data & telemetry
 data/telemetry.json
+data/metrics.json
+data/hunts_history.json
+data/state.json
 data/*.tmp
 data/*.json.tmp
 

@@ -22,6 +22,12 @@ ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
+sys.path.insert(0, str(ROOT_DIR))
+sys.path.insert(0, str(ROOT_DIR / "dashboard"))
+
+from persistence import LocalPersistenceStore
+from metrics import compute_performance_metrics
+
 RUNNING = True
 
 
@@ -127,6 +133,12 @@ class AlpacaLiveClient:
 
     def get_open_orders(self, symbol: str = None):
         url = f"{self.endpoint}/orders?status=open"
+        if symbol:
+            url += f"&symbols={symbol}"
+        return self._request("GET", url)
+
+    def get_closed_orders(self, symbol: str = None, limit: int = 100):
+        url = f"{self.endpoint}/orders?status=closed&limit={limit}&direction=asc"
         if symbol:
             url += f"&symbols={symbol}"
         return self._request("GET", url)
@@ -278,8 +290,28 @@ def main():
     print(f"   Min Margin: {params['min_margin']*100:.3f}% | Max Margin (Circuit Breaker): {params['max_margin']*100:.2f}%")
     print("=" * 70)
 
-    trades_history = []
-    total_realized_pnl = 0.0
+    store = LocalPersistenceStore(DATA_DIR)
+
+    # 1. Recover existing hunts from persistent store (last 50)
+    trades_history = store.load_hunts(max_count=50)
+
+    # 2. If empty, reconcile from Alpaca closed orders history
+    if not trades_history:
+        try:
+            closed_orders = client.get_closed_orders(symbol=symbol, limit=100)
+            trades_history = store.reconcile_alpaca_orders(closed_orders, symbol=symbol)
+            if trades_history:
+                print(f"📦 [PERSISTENCE] Successfully backfilled {len(trades_history)} completed hunts from Alpaca API history.")
+                store.save_hunts(trades_history, max_count=50)
+        except Exception as e:
+            print(f"[WARN] Reconciling closed orders from Alpaca: {e}")
+
+    # 3. Compute and persist initial metrics
+    metrics = compute_performance_metrics(trades_history)
+    store.save_metrics(metrics)
+    total_realized_pnl = float(metrics.get("total_pnl", 0.0))
+
+    print(f"📦 [PERSISTENCE] Active: {len(trades_history)} hunts loaded | Total Realized PnL: ${total_realized_pnl:+.2f} | Win Rate: {metrics.get('win_rate', 0.0)}% | Sharpe: {metrics.get('sharpe_ratio', 0.0)}")
 
     while RUNNING:
         cycle_start = time.time()
@@ -385,11 +417,18 @@ def main():
                         }
                         total_realized_pnl += trade_rec["pnl"]
                         trades_history.append(trade_rec)
-                        print(f"   💰 [EXIT PLACED] SELL {filled_qty} @ ${exit_price:.2f} (Target PnL: +${trade_rec['pnl']:.2f})")
+                        trades_history = trades_history[-50:]
+
+                        # Recompute and persist metrics and hunts
+                        metrics = compute_performance_metrics(trades_history)
+                        store.save_hunts(trades_history, max_count=50)
+                        store.save_metrics(metrics)
+
+                        print(f"   💰 [EXIT PLACED] SELL {filled_qty} @ ${exit_price:.2f} (Target PnL: +${trade_rec['pnl']:.2f} | Total: ${total_realized_pnl:+.2f})")
                     else:
                         print("   ⏱️ [UNFILLED] 20s timeout expired. Remainder canceled. 0 shares bought.")
 
-            # Save snapshot to data/telemetry.json
+            # Save persistent snapshot to data/telemetry.json
             telemetry_snapshot = {
                 "timestamp": now_str,
                 "symbol": symbol,
@@ -404,10 +443,8 @@ def main():
                 "active_hunts_count": 0,
                 "completed_trades_count": len(trades_history),
                 "total_realized_pnl": round(total_realized_pnl, 2),
-                "trades": trades_history,
             }
-            with open(DATA_DIR / "telemetry.json", "w", encoding="utf-8") as f:
-                json.dump(telemetry_snapshot, f, indent=2)
+            store.save_telemetry_snapshot(telemetry_snapshot, trades_history, metrics)
 
         except Exception as e:
             print(f"[{now_str[:19]}] [Error in cycle]: {e}")

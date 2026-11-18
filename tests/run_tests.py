@@ -16,6 +16,7 @@ sys.path.insert(0, str(test_dir))
 
 import test_model
 import test_simulation
+import test_persistence
 
 
 def run_all_tests():
@@ -28,6 +29,7 @@ def run_all_tests():
 
     suite.addTests(loader.loadTestsFromModule(test_model))
     suite.addTests(loader.loadTestsFromModule(test_simulation))
+    suite.addTests(loader.loadTestsFromModule(test_persistence))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
@@ -42,6 +44,7 @@ def run_all_tests():
         print("   - 20s Fill/Cancel & Partial Fill Recovery: PASSED")
         print("   - 12-Hour Stale Order Liquidation: PASSED")
         print("   - NumPy Sharpe Ratio & Risk Metrics: PASSED")
+        print("   - Local Persistence (50 Hunts & Metrics Store): PASSED")
         print("=" * 70)
         return 0
     else:

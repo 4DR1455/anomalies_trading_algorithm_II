@@ -200,6 +200,10 @@ Following a rigorous quantitative evaluation against 30-second intraday bars:
    * Runs in a multi-stage Docker container under a dedicated unprivileged user (`trader`, UID 10001).
    * Read-only root filesystem with persistent `/data` volume.
    * **Strict Network Isolation:** Strictly **NO exposed ports** to the public internet.
+5. **Crash-Safe Local Persistence (Rolling 50 Hunts & Metrics Store):**
+   * Atomically persists the last 50 market hunts (`data/hunts_history.json`) and portfolio risk metrics (`data/metrics.json`) via fsync write-rename transactions.
+   * Performance metrics and recent hunts never reset or start over when the web interface changes, browser refreshes, or bot restarts.
+   * Automatic Alpaca order reconciliation recovers historical round-trip executions seamlessly upon boot if local state was uninitialized.
 
 ---
 

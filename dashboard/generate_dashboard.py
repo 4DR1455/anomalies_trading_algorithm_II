@@ -14,37 +14,53 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Add dashboard folder to path
+# Add parent and dashboard folder to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
+
+from persistence import LocalPersistenceStore
 from metrics import compute_performance_metrics
 
 
 def load_telemetry(data_dir: Path) -> dict:
+    store = LocalPersistenceStore(data_dir)
     telemetry_path = data_dir / "telemetry.json"
+    telemetry = {}
+
     if telemetry_path.exists():
         try:
             with open(telemetry_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                telemetry = json.load(f)
         except Exception as e:
             print(f"Warning: Could not read telemetry: {e}")
 
+    # Ensure last 50 hunts are hydrated from persistent hunts_history.json
+    trades = telemetry.get("trades", [])
+    if not trades:
+        persisted_hunts = store.load_hunts(max_count=50)
+        if persisted_hunts:
+            telemetry["trades"] = persisted_hunts
+            trades = persisted_hunts
+
     # Fallback default empty telemetry
-    return {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "symbol": "SPY",
-        "best_bid": 585.20,
-        "best_ask": 585.22,
-        "market_mid": 585.21,
-        "fair_price": 585.35,
-        "undervaluation_margin": 0.00024,
-        "min_margin": 0.0008,
-        "max_margin": 0.0120,
-        "circuit_breaker_active": False,
-        "active_hunts_count": 0,
-        "completed_trades_count": 0,
-        "total_realized_pnl": 0.0,
-        "trades": [],
-    }
+    if not telemetry:
+        telemetry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "symbol": "SOL/USD",
+            "best_bid": 73.10,
+            "best_ask": 73.18,
+            "market_mid": 73.14,
+            "fair_price": 73.20,
+            "undervaluation_margin": 0.0008,
+            "min_margin": 0.0015,
+            "max_margin": 0.0250,
+            "circuit_breaker_active": False,
+            "active_hunts_count": 0,
+            "completed_trades_count": len(trades),
+            "total_realized_pnl": sum(t.get("pnl", 0.0) for t in trades if t.get("pnl") is not None),
+            "trades": trades,
+        }
+    return telemetry
 
 
 def render_html(telemetry: dict, metrics: dict, output_path: Path):
@@ -360,8 +376,16 @@ def main():
     data_dir = workspace_root / "data"
     output_path = workspace_root / "dashboard" / "index.html"
 
+    store = LocalPersistenceStore(data_dir)
     telemetry = load_telemetry(data_dir)
-    metrics = compute_performance_metrics(telemetry.get("trades", []))
+    trades = telemetry.get("trades", [])
+
+    if trades:
+        metrics = compute_performance_metrics(trades)
+        store.save_metrics(metrics)
+    else:
+        metrics = store.load_metrics()
+
     render_html(telemetry, metrics, output_path)
 
 
