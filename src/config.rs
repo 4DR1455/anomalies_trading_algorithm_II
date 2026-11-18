@@ -14,7 +14,7 @@ pub struct KalmanParams {
 pub struct StrategyParams {
     pub symbol: String,
     pub level: f64,
-    pub max_shares: u32,
+    pub max_shares: f64,
     pub min_margin: f64,
     pub max_margin: f64,
     #[serde(default = "default_cycle_seconds")]
@@ -68,8 +68,8 @@ impl AppConfig {
         if params.level <= 0.0 {
             return Err("level parameter must be strictly positive".to_string());
         }
-        if params.max_shares == 0 {
-            return Err("max_shares must be greater than zero".to_string());
+        if params.max_shares <= 0.0 {
+            return Err("max_shares must be strictly greater than zero".to_string());
         }
 
         let credentials = Self::load_credentials(env_path.as_ref())?;

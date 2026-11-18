@@ -131,6 +131,9 @@ class AlpacaLiveClient:
             url += f"&symbols={symbol}"
         return self._request("GET", url)
 
+    def get_account(self) -> dict:
+        return self._request("GET", f"{self.endpoint}/account")
+
     def get_positions(self, symbol: str = None):
         if symbol:
             try:
@@ -202,15 +205,51 @@ class AdaptiveKalmanLive:
         return "none", margin, x_prior
 
 
-def calculate_shares_amount(margin: float, min_m: float, max_m: float, level: float, max_shares: int) -> int:
-    if margin < min_m or max_shares == 0:
-        return 0
+def calculate_shares_amount(
+    margin: float,
+    min_m: float,
+    max_m: float,
+    level: float,
+    max_shares_param: float,
+    equity: float = 100000.0,
+    available_cash: float = 100000.0,
+    buy_price: float = 75.0,
+) -> float:
+    """
+    Dynamic position sizing:
+    - If max_shares_param <= 1.0: Proportion of total portfolio equity (e.g., 0.20 = 20%, 1.00 = 100%).
+    - If max_shares_param > 1.0: Absolute unit shares mode (legacy backwards compatibility).
+    - If available cash is less than target capital, allocates all remaining cash ("sense asímptota").
+    - Supports fractional quantities for crypto (4 decimals).
+    """
+    if margin < min_m or max_shares_param <= 0.0 or buy_price <= 0.0:
+        return 0.0
     if margin > max_m:
-        return 0
-    x = max(0.0, min(1.0, (margin - min_m) / (max_m - min_m)))
-    factor = 1.0 - ((1.0 - (x ** level)) ** (1.0 / level))
-    shares = int(factor * max_shares)
-    return max(1, shares) if x > 0 and shares == 0 else min(max_shares, shares)
+        return 0.0
+
+    denom = max_m - min_m
+    if denom <= 0:
+        return 0.0
+
+    x = max(0.0, min(1.0, (margin - min_m) / denom))
+    factor = 1.0 - ((1.0 - (x ** level)) ** (1.0 / level)) if level > 0 else x
+
+    if max_shares_param <= 1.0:
+        # Proportion of total portfolio equity mode
+        target_capital = factor * (equity * max_shares_param)
+        allocated_capital = min(target_capital, max(0.0, available_cash))
+
+        # Enforce minimum order threshold ($10.0 on Alpaca)
+        if allocated_capital < 10.0:
+            return 0.0
+
+        # Fractional shares for crypto (up to 4 decimals)
+        qty = round(allocated_capital / buy_price, 4)
+        return qty
+    else:
+        # Legacy absolute unit shares mode
+        shares = int(factor * max_shares_param)
+        return max(1.0, float(shares)) if x > 0 and shares == 0 else min(max_shares_param, float(shares))
 
 
 def main():
@@ -235,7 +274,7 @@ def main():
     print("=" * 70)
     print(f"🚀 ANOMALIES TRADING ENGINE v2.0 (LIVE BOT)")
     print(f"   Symbol: {symbol} | Account: Alpaca Paper Trading")
-    print(f"   Cycle: {cycle_secs}s | Sizing Level: {params['level']} | Max Shares: {params['max_shares']}")
+    print(f"   Cycle: {cycle_secs}s | Sizing Level: {params['level']} | Max Shares/Cap: {params['max_shares']}")
     print(f"   Min Margin: {params['min_margin']*100:.3f}% | Max Margin (Circuit Breaker): {params['max_margin']*100:.2f}%")
     print("=" * 70)
 
@@ -260,16 +299,37 @@ def main():
             if signal == "circuit_breaker":
                 print(f"⚠️ [CIRCUIT BREAKER] Deviation {margin*100:.3f}% > {params['max_margin']*100:.2f}%. Trading HALTED.")
             elif signal == "buy_anomaly":
-                shares = calculate_shares_amount(margin, params["min_margin"], params["max_margin"], params["level"], params["max_shares"])
-                print(f"🎯 [ANOMALY DETECTED] Margin {margin*100:.4f}% >= {params['min_margin']*100:.3f}% -> Sizing {shares} units")
+                # HiddenMM pricing
+                tick = 0.01
+                spread_ticks = round((ask - bid) / tick)
+                buy_price = round(bid + tick, 2) if spread_ticks >= 2 else round(bid, 2)
+
+                # Fetch real-time account equity and cash
+                equity = 100000.0
+                cash = 100000.0
+                try:
+                    acc = client.get_account()
+                    equity = float(acc.get("equity", 100000.0))
+                    cash = float(acc.get("cash", equity))
+                except Exception as e:
+                    print(f"   [Warn] Fetching account balance: {e}")
+
+                max_shares_val = float(params["max_shares"])
+                shares = calculate_shares_amount(
+                    margin,
+                    params["min_margin"],
+                    params["max_margin"],
+                    params["level"],
+                    max_shares_val,
+                    equity=equity,
+                    available_cash=cash,
+                    buy_price=buy_price,
+                )
+
+                print(f"🎯 [ANOMALY DETECTED] Margin {margin*100:.4f}% >= {params['min_margin']*100:.3f}% -> Sizing {shares} units (${shares * buy_price:.2f} | Equity: ${equity:,.2f}, Cash: ${cash:,.2f})")
 
                 if shares > 0:
-                    # HiddenMM pricing
-                    tick = 0.01
-                    spread_ticks = round((ask - bid) / tick)
-                    buy_price = round(bid + tick, 2) if spread_ticks >= 2 else round(bid, 2)
-
-                    print(f"   [HiddenMM] Placing limit BUY {shares} @ ${buy_price:.2f} (maker queue priority)...")
+                    print(f"   [HiddenMM] Placing limit BUY {shares} @ ${buy_price:.2f} (${shares * buy_price:.2f}, maker queue priority)...")
                     buy_ord = client.submit_order(symbol, shares, "buy", "limit", buy_price, tif=tif)
                     ord_id = buy_ord.get("id")
 

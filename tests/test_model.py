@@ -29,6 +29,38 @@ def calculate_shares_amount(margin: float, min_m: float, max_m: float, level: fl
     return min(max_shares, shares)
 
 
+def calculate_dynamic_portfolio_shares(
+    margin: float,
+    min_m: float,
+    max_m: float,
+    level: float,
+    max_shares_fraction: float,
+    total_equity: float,
+    available_cash: float,
+    buy_price: float,
+) -> float:
+    """Calculates position size as a dynamic proportion of total equity capped by available cash."""
+    if margin < min_m or max_shares_fraction <= 0 or buy_price <= 0:
+        return 0.0
+    if margin > max_m:
+        return 0.0
+
+    denom = max_m - min_m
+    if denom <= 0:
+        return 0.0
+
+    x = max(0.0, min(1.0, (margin - min_m) / denom))
+    factor = 1.0 - ((1.0 - (x ** level)) ** (1.0 / level)) if level > 0 else x
+
+    target_capital = factor * (total_equity * max_shares_fraction)
+    allocated_capital = min(target_capital, max(0.0, available_cash))
+
+    if allocated_capital < 10.0:
+        return 0.0
+
+    return round(allocated_capital / buy_price, 4)
+
+
 def get_tick_size(price: float) -> float:
     return 0.01 if price >= 1.0 else 0.0001
 
@@ -145,6 +177,43 @@ class TestCapitalAllocationAndPricing(unittest.TestCase):
         sell_p = calculate_exit_sell_price(entry, fair)
         self.assertEqual(sell_p, 100.15)
         self.assertGreater(sell_p, entry)
+
+    def test_dynamic_portfolio_equity_sizing(self):
+        """
+        Verify dynamic portfolio equity fraction sizing:
+        - max_shares = 1.0 (100% equity): up to $100k
+        - max_shares = 0.2 (20% equity): up to $20k
+        - Cash starvation cap: if available cash < target, allocate remaining cash without asymptote
+        - Fractional crypto share precision
+        """
+        equity = 100000.0
+        cash = 100000.0
+        price = 75.0
+
+        # Full anomaly (x = 1.0) with max_shares = 1.0 (100%) -> $100,000 / $75 = 1333.3333 shares
+        shares_100pct = calculate_dynamic_portfolio_shares(
+            self.max_margin, self.min_margin, self.max_margin, 2.0, 1.0, equity, cash, price
+        )
+        self.assertAlmostEqual(shares_100pct, 1333.3333, places=3)
+
+        # Full anomaly (x = 1.0) with max_shares = 0.2 (20%) -> $20,000 / $75 = 266.6667 shares
+        shares_20pct = calculate_dynamic_portfolio_shares(
+            self.max_margin, self.min_margin, self.max_margin, 2.0, 0.2, equity, cash, price
+        )
+        self.assertAlmostEqual(shares_20pct, 266.6667, places=3)
+
+        # Cash starvation: target is $20,000, but only $5,000 cash remaining -> allocate all remaining $5,000 / $75 = 66.6667 shares
+        limited_cash = 5000.0
+        shares_starved = calculate_dynamic_portfolio_shares(
+            self.max_margin, self.min_margin, self.max_margin, 2.0, 0.2, equity, limited_cash, price
+        )
+        self.assertAlmostEqual(shares_starved, 66.6667, places=3)
+
+        # Circuit breaker trigger (> max_margin) -> 0 shares
+        shares_cb = calculate_dynamic_portfolio_shares(
+            0.0250, self.min_margin, self.max_margin, 2.0, 1.0, equity, cash, price
+        )
+        self.assertEqual(shares_cb, 0.0)
 
 
 if __name__ == "__main__":

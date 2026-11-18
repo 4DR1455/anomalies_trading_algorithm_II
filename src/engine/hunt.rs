@@ -34,9 +34,9 @@ impl<'a> HuntExecutor<'a> {
         best_bid: f64,
         best_ask: f64,
         fair_price: f64,
-        shares_to_buy: u32,
+        shares_to_buy: f64,
     ) -> Result<Option<TradeRecord>, String> {
-        if shares_to_buy == 0 {
+        if shares_to_buy <= 0.0 {
             return Ok(None);
         }
 
@@ -107,7 +107,7 @@ impl<'a> HuntExecutor<'a> {
         let filled_qty = final_order.parsed_filled_qty();
         let avg_price = final_order.parsed_avg_price().unwrap_or(buy_price);
 
-        if filled_qty == 0 {
+        if filled_qty <= 0.0 {
             info!("HiddenMM order {} finished with 0 fills. Hunt ended.", order_id);
             return Ok(None);
         }

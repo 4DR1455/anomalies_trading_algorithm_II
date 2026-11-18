@@ -8,19 +8,19 @@ pub fn calculate_shares_amount(
     min_margin: f64,
     max_margin: f64,
     level: f64,
-    max_shares: u32,
-) -> u32 {
-    if undervaluation_margin < min_margin || max_shares == 0 || level <= 0.0 {
-        return 0;
+    max_shares: f64,
+) -> f64 {
+    if undervaluation_margin < min_margin || max_shares <= 0.0 || level <= 0.0 {
+        return 0.0;
     }
     if undervaluation_margin > max_margin {
         // Circuit breaker: halted
-        return 0;
+        return 0.0;
     }
 
     let denominator = max_margin - min_margin;
     if denominator <= 0.0 {
-        return 0;
+        return 0.0;
     }
 
     let x = ((undervaluation_margin - min_margin) / denominator).clamp(0.0, 1.0);
@@ -30,13 +30,48 @@ pub fn calculate_shares_amount(
     let inner = (1.0 - x_pow).clamp(0.0, 1.0);
     let factor = 1.0 - inner.powf(1.0 / level);
 
-    let shares = (max_shares as f64 * factor).floor() as u32;
-    // If signal triggered and above min_margin, allocate at least 1 share if max_shares >= 1
-    if shares == 0 && max_shares > 0 && x > 0.0 {
-        1
-    } else {
-        shares.min(max_shares)
+    let shares = max_shares * factor;
+    shares.min(max_shares)
+}
+
+/// Dynamic portfolio position sizing:
+/// Scales with total equity and caps at available cash without artificial asymptotes.
+pub fn calculate_dynamic_portfolio_shares(
+    undervaluation_margin: f64,
+    min_margin: f64,
+    max_margin: f64,
+    level: f64,
+    max_shares_fraction: f64,
+    total_equity: f64,
+    available_cash: f64,
+    buy_price: f64,
+) -> f64 {
+    if undervaluation_margin < min_margin || max_shares_fraction <= 0.0 || buy_price <= 0.0 {
+        return 0.0;
     }
+    if undervaluation_margin > max_margin {
+        return 0.0;
+    }
+
+    let denominator = max_margin - min_margin;
+    if denominator <= 0.0 {
+        return 0.0;
+    }
+
+    let x = ((undervaluation_margin - min_margin) / denominator).clamp(0.0, 1.0);
+    let x_pow = x.powf(level);
+    let inner = (1.0 - x_pow).clamp(0.0, 1.0);
+    let factor = 1.0 - inner.powf(1.0 / level);
+
+    let target_capital = factor * (total_equity * max_shares_fraction);
+    let allocated_capital = target_capital.min(available_cash.max(0.0));
+
+    if allocated_capital < 10.0 {
+        return 0.0;
+    }
+
+    let qty = (allocated_capital / buy_price * 10000.0).round() / 10000.0;
+    qty
 }
 
 /// SEC Rule 612 Minimum Price Variation (MPV) tick size
@@ -114,20 +149,20 @@ mod tests {
     fn test_asymptotic_sizing_bounds() {
         let min_m = 0.0010;
         let max_m = 0.0100;
-        let max_s = 100;
+        let max_s = 100.0;
 
         // Below min margin -> 0
-        assert_eq!(calculate_shares_amount(0.0005, min_m, max_m, 2.0, max_s), 0);
+        assert_eq!(calculate_shares_amount(0.0005, min_m, max_m, 2.0, max_s), 0.0);
 
-        // At min margin -> 0 or 1
+        // At min margin -> 0
         let s_at_min = calculate_shares_amount(min_m, min_m, max_m, 2.0, max_s);
-        assert!(s_at_min <= 1);
+        assert!(s_at_min <= 0.01);
 
         // At max margin -> max_shares
-        assert_eq!(calculate_shares_amount(max_m, min_m, max_m, 2.0, max_s), max_s);
+        assert!((calculate_shares_amount(max_m, min_m, max_m, 2.0, max_s) - max_s).abs() < 1e-6);
 
         // Above max margin (circuit breaker) -> 0
-        assert_eq!(calculate_shares_amount(0.0150, min_m, max_m, 2.0, max_s), 0);
+        assert_eq!(calculate_shares_amount(0.0150, min_m, max_m, 2.0, max_s), 0.0);
     }
 
     #[test]

@@ -11,7 +11,7 @@ pub struct TradeRecord {
     pub symbol: String,
     pub buy_order_id: String,
     pub sell_order_id: Option<String>,
-    pub qty: u32,
+    pub qty: f64,
     pub buy_price: f64,
     pub sell_price: Option<f64>,
     pub pnl: Option<f64>,

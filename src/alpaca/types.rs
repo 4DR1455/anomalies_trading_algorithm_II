@@ -71,8 +71,8 @@ impl Order {
         self.status == "filled"
     }
 
-    pub fn parsed_filled_qty(&self) -> u32 {
-        self.filled_qty.parse::<f64>().map(|v| v as u32).unwrap_or(0)
+    pub fn parsed_filled_qty(&self) -> f64 {
+        self.filled_qty.parse::<f64>().unwrap_or(0.0)
     }
 
     pub fn parsed_avg_price(&self) -> Option<f64> {

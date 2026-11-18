@@ -141,7 +141,7 @@ impl TradingEngine {
                     undervaluation_margin * 100.0, fair_price, market_mid, shares
                 );
 
-                if shares > 0 {
+                if shares > 0.0 {
                     let executor = HuntExecutor::new(
                         &self.client,
                         symbol,
