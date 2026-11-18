@@ -78,9 +78,9 @@ Every 30 seconds, the engine queries the latest National Best Bid and Offer (NBB
 
 ### 2. Thresholding & Circuit Breaker
 
-* **Buy Signal:** Triggered when $m_t \ge \text{min\_margin}$ (undervaluation anomaly detected).
+* **Buy Signal:** Triggered when $m_t \ge m_{\min}$ (where $m_{\min}$ is `min_margin`, undervaluation anomaly detected).
 * **Circuit Breaker / Volatility Ceiling (`max_margin`):**
-  If $m_t > \text{max\_margin}$ (e.g., flash crash or news dump), **trading halts immediately**. The state update is heavily gated to prevent poisoning the filter with extreme anomalies.
+  If $m_t > m_{\max}$ (where $m_{\max}$ is `max_margin`, e.g., flash crash or news dump), **trading halts immediately**. The state update is heavily gated to prevent poisoning the filter with extreme anomalies.
 
 ### 3. Dynamic Position Sizing (Asymptotic Formula)
 
@@ -89,7 +89,8 @@ Instead of fixed lots, capital allocation scales dynamically according to the no
 $$SharesAmount(x) = Max \times \left(1 - (1 - x^{level})^{\frac{1}{level}}\right)$$
 
 *Where:*
-* $x$: Normalized deviation ratio $\text{clamp}\left(\frac{m_t - \text{min\_margin}}{\text{max\_margin} - \text{min\_margin}},\, 0,\, 1\right)$.
+* $x$: Normalized deviation ratio scaled between `min_margin` ($m_{\min}$) and `max_margin` ($m_{\max}$):
+  $$x = \mathrm{clamp}\left(\frac{m_t - m_{\min}}{m_{\max} - m_{\min}},\, 0,\, 1\right)$$
 * $Max$: Maximum shares/units per trade (`max_shares`).
 * $level$: Convexity parameter:
   * $level < 1.0$: Aggressive allocation (reacts strongly to smaller anomalies).
