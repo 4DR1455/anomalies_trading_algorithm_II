@@ -19,25 +19,44 @@ The v2.0 system follows a strict "Separation of Concerns" principle to maximize 
 
 ```mermaid
 flowchart TD
-    A["Alpaca Markets API<br/>REST v2 & v1beta3"] <-->|HTTPS / Pure TLS| B["Unified Trading Engine<br/>Async / Memory Safe"]
-    
+    A["Alpaca Markets API<br/>REST v2 and v1beta3"]
+    G["params.json<br/>Dynamic Config"]
+
     subgraph EngineCore ["Engine Core (adria user)"]
-        B <--> C{"Strategy Brain<br/>Adaptive 1D Kalman Filter"}
-        B <--> H["Order Execution & Hygiene<br/>HiddenMM + 12h Stale Liquidation"]
-        B -->|Atomic fsync + replace| S[("State & Telemetry Store<br/>data/telemetry.json")]
+        B["Unified Trading Engine<br/>Async / Memory Safe"]
+        C["Strategy Brain<br/>Adaptive 1D Kalman Filter"]
+        H["Order Execution and Hygiene<br/>HiddenMM + 12h Stale Liquidation"]
+        S[("State and Telemetry Store<br/>data/telemetry.json")]
+
+        B --- C
+        B --- H
+        B -- "Atomic fsync + replace" --> S
     end
 
-    S -->|Read-Only Bind Mount| D["Unprivileged Web Backend<br/>Waitress WSGI / traderweb user"]
-    D <-->|Internal HTTP / 127.0.0.1:8080| E["Hardened Nginx Reverse Proxy<br/>Ports 80 & 443 + Let's Encrypt SSL"]
-    E <-->|HTTPS / HTTP2| F["Public Web Dashboard<br/>adria-trading-bot.duckdns.org"]
-    G["params.json"] -.->|Dynamic Hyperparameters| B
+    A -- "HTTPS / Pure TLS" --> B
+    B -- "Orders and Quotes" --> A
+    G -. "Dynamic Parameters" .-> B
 
+    subgraph WebStack ["Web Analytics Stack"]
+        D["Unprivileged Web Backend<br/>Waitress WSGI / traderweb"]
+        E["Hardened Nginx Reverse Proxy<br/>Ports 80 and 443 + SSL"]
+        F["Public Web Dashboard<br/>adria-trading-bot.duckdns.org"]
+
+        D -- "Internal HTTP (127.0.0.1:8080)" --> E
+        E -- "HTTPS / HTTP2" --> F
+    end
+
+    S -- "Read-Only Bind Mount" --> D
+
+    style A fill:#4a86e8,stroke:#333,stroke-width:2px,color:white
     style B fill:#e65c00,stroke:#333,stroke-width:2px,color:white
     style C fill:#2b5c8f,stroke:#333,stroke-width:2px,color:white
     style H fill:#2b5c8f,stroke:#333,stroke-width:2px,color:white
+    style S fill:#1e293b,stroke:#333,stroke-width:2px,color:white
+    style D fill:#4b5563,stroke:#333,stroke-width:2px,color:white
     style E fill:#0d6efd,stroke:#333,stroke-width:2px,color:white
     style F fill:#28a745,stroke:#333,stroke-width:2px,color:white
-    style D fill:#4b5563,stroke:#333,stroke-width:2px,color:white
+    style G fill:#334155,stroke:#333,stroke-width:2px,color:white
 ```
 
 ---
