@@ -137,10 +137,12 @@ class AlpacaLiveClient:
             url += f"&symbols={symbol}"
         return self._request("GET", url)
 
-    def get_closed_orders(self, symbol: str = None, limit: int = 100):
+    def get_closed_orders(self, symbol: str = None, limit: int = 500, after: str = None):
         url = f"{self.endpoint}/orders?status=closed&limit={limit}&direction=asc"
         if symbol:
             url += f"&symbols={symbol}"
+        if after:
+            url += f"&after={after}"
         return self._request("GET", url)
 
     def get_account(self) -> dict:
@@ -298,7 +300,7 @@ def main():
     # 2. If empty, reconcile from Alpaca closed orders history
     if not trades_history:
         try:
-            closed_orders = client.get_closed_orders(symbol=symbol, limit=100)
+            closed_orders = client.get_closed_orders(symbol=symbol, limit=500)
             trades_history = store.reconcile_alpaca_orders(closed_orders, symbol=symbol)
             if trades_history:
                 print(f"📦 [PERSISTENCE] Successfully backfilled {len(trades_history)} completed hunts from Alpaca API history.")
@@ -318,6 +320,40 @@ def main():
         now_str = datetime.now(timezone.utc).isoformat()
 
         try:
+            # Check and reconcile pending exit orders
+            pending_updated = False
+            for hunt in trades_history:
+                if hunt.get("status") == "open_exit_pending" and hunt.get("sell_order_id"):
+                    sell_oid = hunt["sell_order_id"]
+                    try:
+                        chk_sell = client.get_order(sell_oid)
+                        sell_status = chk_sell.get("status")
+                        if sell_status == "filled":
+                            fill_px = float(chk_sell.get("filled_avg_price") or hunt.get("sell_price") or 0.0)
+                            fill_qty = float(chk_sell.get("filled_qty") or hunt.get("qty") or 0.0)
+                            fill_time = chk_sell.get("filled_at") or chk_sell.get("created_at") or now_str
+                            buy_px = float(hunt.get("buy_price", 0.0))
+                            actual_pnl = round((fill_px - buy_px) * fill_qty, 2)
+                            actual_pnl_pct = round((fill_px - buy_px) / buy_px, 4) if buy_px > 0 else 0.0
+
+                            hunt["sell_price"] = fill_px
+                            hunt["sell_timestamp"] = fill_time
+                            hunt["pnl"] = actual_pnl
+                            hunt["pnl_pct"] = actual_pnl_pct
+                            hunt["status"] = "completed"
+                            pending_updated = True
+                            print(f"   ✅ [EXIT FILLED] Hunt {hunt['id']}: Sold {fill_qty} @ ${fill_px:.2f} (Realized PnL: ${actual_pnl:+.2f})")
+                        elif sell_status in ["canceled", "rejected", "expired"]:
+                            print(f"   ⚠️ [EXIT FAILED] Hunt {hunt['id']}: Order {sell_oid} status is {sell_status}.")
+                    except Exception as ex:
+                        print(f"   [Warn] Polling pending exit order {sell_oid}: {ex}")
+
+            if pending_updated:
+                metrics = compute_performance_metrics(trades_history)
+                store.save_hunts(trades_history, max_count=50)
+                store.save_metrics(metrics)
+                total_realized_pnl = float(metrics.get("total_pnl", 0.0))
+
             quote = client.get_latest_quote(symbol)
             bid = float(quote["bp"])
             ask = float(quote["ap"])
@@ -396,10 +432,19 @@ def main():
                             pass
 
                     if filled_qty > 0:
+                        buy_fill_time = chk.get("filled_at") or now_str
                         print(f"   ✅ [FILLED] {filled_qty} units @ ${avg_price:.2f}. Submitting Exit Limit SELL...")
                         exit_price = max(round(avg_price + tick, 2), round(fair_price, 2))
                         sell_ord = client.submit_order(symbol, filled_qty, "sell", "limit", exit_price, tif=tif)
                         sell_id = sell_ord.get("id")
+
+                        # Verify if exit sell filled immediately
+                        sell_status = sell_ord.get("status")
+                        is_filled = (sell_status == "filled")
+                        sell_time = (sell_ord.get("filled_at") or now_str) if is_filled else None
+                        status = "completed" if is_filled else "open_exit_pending"
+                        trade_pnl = round((exit_price - avg_price) * filled_qty, 2) if is_filled else None
+                        trade_pnl_pct = round((exit_price - avg_price) / avg_price, 4) if (is_filled and avg_price > 0) else None
 
                         trade_rec = {
                             "id": str(uuid.uuid4())[:8],
@@ -409,13 +454,12 @@ def main():
                             "qty": filled_qty,
                             "buy_price": avg_price,
                             "sell_price": exit_price,
-                            "pnl": round((exit_price - avg_price) * filled_qty, 2),
-                            "pnl_pct": round((exit_price - avg_price) / avg_price, 4),
-                            "buy_timestamp": now_str,
-                            "sell_timestamp": None,
-                            "status": "completed",
+                            "pnl": trade_pnl,
+                            "pnl_pct": trade_pnl_pct,
+                            "buy_timestamp": buy_fill_time,
+                            "sell_timestamp": sell_time,
+                            "status": status,
                         }
-                        total_realized_pnl += trade_rec["pnl"]
                         trades_history.append(trade_rec)
                         trades_history = trades_history[-50:]
 
@@ -423,12 +467,18 @@ def main():
                         metrics = compute_performance_metrics(trades_history)
                         store.save_hunts(trades_history, max_count=50)
                         store.save_metrics(metrics)
+                        total_realized_pnl = float(metrics.get("total_pnl", 0.0))
 
-                        print(f"   💰 [EXIT PLACED] SELL {filled_qty} @ ${exit_price:.2f} (Target PnL: +${trade_rec['pnl']:.2f} | Total: ${total_realized_pnl:+.2f})")
+                        if is_filled:
+                            print(f"   💰 [EXIT FILLED] SELL {filled_qty} @ ${exit_price:.2f} (PnL: +${trade_pnl:.2f} | Total: ${total_realized_pnl:+.2f})")
+                        else:
+                            print(f"   ⏳ [EXIT PLACED] SELL {filled_qty} @ ${exit_price:.2f} (Status: open_exit_pending | Order ID: {sell_id})")
                     else:
                         print("   ⏱️ [UNFILLED] 20s timeout expired. Remainder canceled. 0 shares bought.")
 
             # Save persistent snapshot to data/telemetry.json
+            active_hunts_count = len([t for t in trades_history if t.get("status") == "open_exit_pending"])
+            completed_trades_count = len([t for t in trades_history if t.get("status") == "completed"])
             telemetry_snapshot = {
                 "timestamp": now_str,
                 "symbol": symbol,
@@ -440,8 +490,8 @@ def main():
                 "min_margin": params["min_margin"],
                 "max_margin": params["max_margin"],
                 "circuit_breaker_active": signal == "circuit_breaker",
-                "active_hunts_count": 0,
-                "completed_trades_count": len(trades_history),
+                "active_hunts_count": active_hunts_count,
+                "completed_trades_count": completed_trades_count,
                 "total_realized_pnl": round(total_realized_pnl, 2),
             }
             store.save_telemetry_snapshot(telemetry_snapshot, trades_history, metrics)

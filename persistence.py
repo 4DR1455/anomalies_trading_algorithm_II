@@ -11,7 +11,7 @@ and process reloads without starting over.
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -132,43 +132,110 @@ class LocalPersistenceStore:
         return hunts, metrics
 
     @staticmethod
-    def reconcile_alpaca_orders(orders: List[Dict[str, Any]], symbol: str = "SOL/USD") -> List[Dict[str, Any]]:
+    def reconcile_alpaca_orders(
+        orders: List[Dict[str, Any]],
+        symbol: str = "SOL/USD",
+        min_date: Optional[str] = "2026-11-01",
+    ) -> List[Dict[str, Any]]:
         """
         Reconstructs completed round-trip hunts from Alpaca API closed order history
         if local history was cleared or uninitialized.
+        Filters strictly for active algorithm deployment orders (client_order_id containing 'hunt-'
+        or timestamps >= min_date) and performs temporal FIFO order reconciliation (< 24h duration)
+        with accurate sell timestamps and realized PnL calculations.
         """
+        def parse_iso(ts_str: Optional[str]) -> Optional[datetime]:
+            if not ts_str:
+                return None
+            try:
+                clean_str = ts_str.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(clean_str)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+            except Exception:
+                return None
+
         buys = []
         sells = []
         for o in orders:
-            if o.get("symbol") == symbol and float(o.get("filled_qty", 0)) > 0:
-                if o.get("side") == "buy":
-                    buys.append(o)
-                elif o.get("side") == "sell":
-                    sells.append(o)
+            if o.get("symbol") != symbol:
+                continue
+            qty = float(o.get("filled_qty") or 0.0)
+            if qty <= 0.0:
+                continue
 
+            cid = str(o.get("client_order_id") or "")
+            ts = str(o.get("filled_at") or o.get("created_at") or "")
+
+            # Deployment filter: only accept orders from active deployment
+            if min_date and ts and ts < min_date:
+                continue
+            if not ("hunt-" in cid or (min_date and ts and ts >= min_date)):
+                continue
+
+            f_time = parse_iso(ts) or datetime.min.replace(tzinfo=timezone.utc)
+            c_time = parse_iso(o.get("created_at")) or f_time
+
+            item = (f_time, c_time, o)
+            if o.get("side") == "buy":
+                buys.append(item)
+            elif o.get("side") == "sell":
+                sells.append(item)
+
+        # Sort buys chronologically by fill time
+        buys.sort(key=lambda x: x[0])
+        # Sort sells chronologically by order submission / creation time
+        sells.sort(key=lambda x: x[1])
+
+        used_sells = set()
         hunts = []
-        for i in range(min(len(buys), len(sells))):
-            b = buys[i]
-            s = sells[i]
-            b_price = float(b.get("filled_avg_price") or b.get("limit_price") or 0.0)
-            s_price = float(s.get("filled_avg_price") or s.get("limit_price") or 0.0)
-            qty = float(b.get("filled_qty") or 0.0)
-            pnl = round((s_price - b_price) * qty, 2)
-            pnl_pct = round((s_price - b_price) / b_price, 4) if b_price > 0 else 0.0
 
-            hunts.append({
-                "id": str(b.get("id", ""))[:8],
-                "symbol": symbol,
-                "buy_order_id": b.get("id"),
-                "sell_order_id": s.get("id"),
-                "qty": qty,
-                "buy_price": b_price,
-                "sell_price": s_price,
-                "pnl": pnl,
-                "pnl_pct": pnl_pct,
-                "buy_timestamp": b.get("filled_at") or b.get("created_at"),
-                "sell_timestamp": s.get("filled_at") or s.get("created_at"),
-                "status": "completed",
-            })
+        for b_f_time, b_c_time, b in buys:
+            b_qty = float(b.get("filled_qty") or 0.0)
+            matched_idx = None
+
+            # Pass 1: Match sell created shortly after buy fill (within 10m) with matching quantity
+            for s_idx, (s_f_time, s_c_time, s) in enumerate(sells):
+                if s_idx in used_sells:
+                    continue
+                s_qty = float(s.get("filled_qty") or 0.0)
+                if s_f_time >= b_f_time and (s_f_time - b_f_time) < timedelta(hours=24):
+                    if abs(s_qty - b_qty) < 1e-4 and s_c_time >= b_f_time - timedelta(seconds=30) and (s_c_time - b_f_time) < timedelta(minutes=10):
+                        matched_idx = s_idx
+                        break
+
+            # Pass 2: Strict temporal FIFO fallback (< 24h holding duration)
+            if matched_idx is None:
+                for s_idx, (s_f_time, s_c_time, s) in enumerate(sells):
+                    if s_idx in used_sells:
+                        continue
+                    if s_f_time >= b_f_time and (s_f_time - b_f_time) < timedelta(hours=24):
+                        matched_idx = s_idx
+                        break
+
+            if matched_idx is not None:
+                used_sells.add(matched_idx)
+                s = sells[matched_idx][2]
+                b_price = float(b.get("filled_avg_price") or b.get("limit_price") or 0.0)
+                s_price = float(s.get("filled_avg_price") or s.get("limit_price") or 0.0)
+                qty = b_qty
+                pnl = round((s_price - b_price) * qty, 2)
+                pnl_pct = round((s_price - b_price) / b_price, 4) if b_price > 0 else 0.0
+
+                hunts.append({
+                    "id": str(b.get("id", ""))[:8],
+                    "symbol": symbol,
+                    "buy_order_id": b.get("id"),
+                    "sell_order_id": s.get("id"),
+                    "qty": qty,
+                    "buy_price": b_price,
+                    "sell_price": s_price,
+                    "pnl": pnl,
+                    "pnl_pct": pnl_pct,
+                    "buy_timestamp": b.get("filled_at") or b.get("created_at"),
+                    "sell_timestamp": s.get("filled_at") or s.get("created_at"),
+                    "status": "completed",
+                })
 
         return hunts[-50:]

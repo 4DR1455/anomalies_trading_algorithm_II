@@ -104,7 +104,7 @@ class TestLocalPersistence(unittest.TestCase):
         self.assertEqual(telemetry["metrics"]["total_pnl"], 5.0)
 
     def test_alpaca_closed_orders_reconciliation(self):
-        """Verify pairing of Alpaca closed buy and sell orders into completed hunts."""
+        """Verify pairing of Alpaca closed buy and sell orders into completed hunts with valid timestamps."""
         mock_orders = [
             {"id": "buy-1", "symbol": "SOL/USD", "side": "buy", "filled_qty": "2.5", "filled_avg_price": "70.00", "filled_at": "2026-11-18T10:00:00Z"},
             {"id": "sell-1", "symbol": "SOL/USD", "side": "sell", "filled_qty": "2.5", "filled_avg_price": "70.50", "filled_at": "2026-11-18T10:08:00Z"},
@@ -120,11 +120,67 @@ class TestLocalPersistence(unittest.TestCase):
         self.assertEqual(hunts[0]["buy_price"], 70.00)
         self.assertEqual(hunts[0]["sell_price"], 70.50)
         self.assertEqual(hunts[0]["pnl"], 1.25)
+        self.assertEqual(hunts[0]["buy_timestamp"], "2026-11-18T10:00:00Z")
+        self.assertEqual(hunts[0]["sell_timestamp"], "2026-11-18T10:08:00Z")
         self.assertEqual(hunts[0]["status"], "completed")
 
         # Second trade: buy @ 71.00, sell @ 70.80, qty 1.0 -> pnl = -0.20
         self.assertEqual(hunts[1]["qty"], 1.0)
         self.assertEqual(hunts[1]["pnl"], -0.20)
+        self.assertEqual(hunts[1]["buy_timestamp"], "2026-11-18T11:00:00Z")
+        self.assertEqual(hunts[1]["sell_timestamp"], "2026-11-18T11:05:00Z")
+
+    def test_alpaca_reconciliation_filters_ancient_orders(self):
+        """Verify ancient orders (e.g. August 2026 at $103) are never cross-paired with November sells."""
+        mock_orders = [
+            # Ancient order from August 31, 2026
+            {"id": "old-buy", "symbol": "SOL/USD", "side": "buy", "filled_qty": "10.0", "filled_avg_price": "103.50", "filled_at": "2026-08-31T10:00:00Z"},
+            # Recent November order
+            {"id": "nov-buy", "symbol": "SOL/USD", "side": "buy", "filled_qty": "1.0", "filled_avg_price": "74.00", "filled_at": "2026-11-18T10:00:00Z", "client_order_id": "hunt-buy-123"},
+            {"id": "nov-sell", "symbol": "SOL/USD", "side": "sell", "filled_qty": "1.0", "filled_avg_price": "74.20", "filled_at": "2026-11-18T10:05:00Z", "client_order_id": "hunt-sell-123"},
+        ]
+
+        hunts = LocalPersistenceStore.reconcile_alpaca_orders(mock_orders, symbol="SOL/USD")
+        self.assertEqual(len(hunts), 1)
+        self.assertEqual(hunts[0]["buy_order_id"], "nov-buy")
+        self.assertEqual(hunts[0]["sell_order_id"], "nov-sell")
+        self.assertEqual(hunts[0]["buy_price"], 74.00)
+        self.assertEqual(hunts[0]["sell_price"], 74.20)
+        self.assertEqual(hunts[0]["pnl"], 0.20)
+        self.assertEqual(hunts[0]["buy_timestamp"], "2026-11-18T10:00:00Z")
+        self.assertEqual(hunts[0]["sell_timestamp"], "2026-11-18T10:05:00Z")
+
+    def test_alpaca_temporal_fifo_pairing(self):
+        """Verify strict chronological pairing even if orders are shuffled in the list."""
+        mock_orders = [
+            # Sell for batch 1 (filled later)
+            {"id": "s1", "symbol": "SOL/USD", "side": "sell", "filled_qty": "2.0", "filled_avg_price": "75.50", "filled_at": "2026-11-18T12:30:00Z", "created_at": "2026-11-18T12:01:00Z"},
+            # Buy batch 1
+            {"id": "b1", "symbol": "SOL/USD", "side": "buy", "filled_qty": "2.0", "filled_avg_price": "75.00", "filled_at": "2026-11-18T12:00:00Z", "created_at": "2026-11-18T12:00:00Z"},
+            # Buy batch 2
+            {"id": "b2", "symbol": "SOL/USD", "side": "buy", "filled_qty": "3.0", "filled_avg_price": "74.00", "filled_at": "2026-11-18T13:00:00Z", "created_at": "2026-11-18T13:00:00Z"},
+            # Sell for batch 2
+            {"id": "s2", "symbol": "SOL/USD", "side": "sell", "filled_qty": "3.0", "filled_avg_price": "74.50", "filled_at": "2026-11-18T13:10:00Z", "created_at": "2026-11-18T13:01:00Z"},
+        ]
+
+        hunts = LocalPersistenceStore.reconcile_alpaca_orders(mock_orders, symbol="SOL/USD")
+        self.assertEqual(len(hunts), 2)
+        self.assertEqual(hunts[0]["buy_order_id"], "b1")
+        self.assertEqual(hunts[0]["sell_order_id"], "s1")
+        self.assertEqual(hunts[0]["pnl"], 1.00)
+
+        self.assertEqual(hunts[1]["buy_order_id"], "b2")
+        self.assertEqual(hunts[1]["sell_order_id"], "s2")
+        self.assertEqual(hunts[1]["pnl"], 1.50)
+
+    def test_alpaca_rejects_exceeding_duration(self):
+        """Verify that sell orders more than 24h after buy are not paired."""
+        mock_orders = [
+            {"id": "b-old", "symbol": "SOL/USD", "side": "buy", "filled_qty": "1.0", "filled_avg_price": "70.00", "filled_at": "2026-11-10T10:00:00Z"},
+            {"id": "s-late", "symbol": "SOL/USD", "side": "sell", "filled_qty": "1.0", "filled_avg_price": "75.00", "filled_at": "2026-11-15T10:00:00Z"},
+        ]
+        hunts = LocalPersistenceStore.reconcile_alpaca_orders(mock_orders, symbol="SOL/USD")
+        self.assertEqual(len(hunts), 0)
 
 
 if __name__ == "__main__":
