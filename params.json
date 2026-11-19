@@ -1,8 +1,8 @@
 {
   "symbol": "SOL/USD",
-  "level": 2.0,
+  "level": 0.05,
   "max_shares": 1.0,
-  "min_margin": 0.0015,
+  "min_margin": 0.00293,
   "max_margin": 0.0250,
   "cycle_seconds": 30,
   "hidden_mm_timeout_seconds": 20,
