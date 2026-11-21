@@ -283,8 +283,8 @@ class AlpacaLiveClient:
             url += f"&symbols={symbol}"
         return self._request("GET", url)
 
-    def get_closed_orders(self, symbol: str = None, limit: int = 500, after: str = None):
-        url = f"{self.endpoint}/orders?status=closed&limit={limit}&direction=asc"
+    def get_closed_orders(self, symbol: str = None, limit: int = 500, after: str = None, direction: str = "desc"):
+        url = f"{self.endpoint}/orders?status=closed&limit={limit}&direction={direction}"
         if symbol:
             url += f"&symbols={symbol}"
         if after:
@@ -1159,8 +1159,8 @@ def main():
     # 2. If empty, reconcile from Alpaca closed orders history
     if not trades_history:
         try:
-            closed_orders = client.get_closed_orders(symbol=symbol, limit=500)
-            trades_history = store.reconcile_alpaca_orders(closed_orders, symbol=symbol)
+            closed_orders = client.get_closed_orders(symbol=symbol, limit=500, direction="desc")
+            trades_history = store.reconcile_alpaca_orders(closed_orders, symbol=symbol, min_date=None)
             if trades_history:
                 print(f"📦 [PERSISTENCE] Successfully backfilled {len(trades_history)} completed hunts from Alpaca API history.")
                 store.save_hunts(trades_history, max_count=50)

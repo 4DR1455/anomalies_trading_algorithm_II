@@ -203,11 +203,12 @@ class LocalPersistenceStore:
             cid = str(o.get("client_order_id") or "")
             ts = str(o.get("filled_at") or o.get("created_at") or "")
 
-            # Deployment filter: only accept orders from active deployment
-            if min_date and ts and ts < min_date:
-                continue
-            if not ("hunt-" in cid or (min_date and ts and ts >= min_date)):
-                continue
+            # Deployment filter: apply date/prefix filter only when min_date is specified
+            if min_date:
+                if ts and ts < min_date:
+                    continue
+                if not ("hunt-" in cid or (ts and ts >= min_date)):
+                    continue
 
             f_time = parse_iso(ts) or datetime.min.replace(tzinfo=timezone.utc)
             c_time = parse_iso(o.get("created_at")) or f_time

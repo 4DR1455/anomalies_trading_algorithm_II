@@ -104,7 +104,7 @@ def compute_performance_metrics(
         "sharpe_ratio": round(sharpe_ratio, 2),
         "max_drawdown_pct": round(max_drawdown_pct, 2),
         "max_drawdown_dollars": round(max_drawdown_dollars, 2),
-        "annualized_volatility": round(annualized_vol * 100.0, 2),
+        "annualized_volatility": round(float(annualized_vol * 100.0), 2),
         "avg_pnl_per_trade": round(float(np.mean(pnls)), 2) if len(pnls) > 0 else 0.0,
         "profit_factor": round(profit_factor, 2) if profit_factor != float("inf") else 999.0,
         "cumulative_pnl_series": [round(float(x), 2) for x in cumulative_pnl],
