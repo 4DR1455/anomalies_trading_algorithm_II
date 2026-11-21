@@ -209,9 +209,13 @@ def render_dashboard_html(telemetry: dict, metrics: dict) -> str:
 
     cum_pnl = metrics.get("cumulative_pnl_series", [0.0])
     drawdown = metrics.get("drawdown_series", [0.0])
-    trade_indices = list(range(1, len(cum_pnl) + 1)) if len(cum_pnl) > 0 else [1]
+    chart_labels = metrics.get("chart_labels")
+    if isinstance(chart_labels, list) and len(chart_labels) == len(cum_pnl) and len(chart_labels) > 0:
+        x_labels = chart_labels
+    else:
+        x_labels = list(range(1, len(cum_pnl) + 1)) if len(cum_pnl) > 0 else [1]
 
-    labels_attr = html.escape(json.dumps(trade_indices), quote=True)
+    labels_attr = html.escape(json.dumps(x_labels), quote=True)
     pnl_attr = html.escape(json.dumps(cum_pnl), quote=True)
     dd_attr = html.escape(json.dumps(drawdown), quote=True)
 
@@ -226,10 +230,29 @@ def render_dashboard_html(telemetry: dict, metrics: dict) -> str:
     max_margin = float(telemetry.get("max_margin") or 0.0)
     active_hunts = int(telemetry.get("active_hunts_count") or len(active_list))
 
+    is_alpaca_history = metrics.get("source") == "alpaca_portfolio_history"
+    start_date_esc = html.escape(str(metrics.get("start_date") or "2026-02-10"))
     total_pnl = float(metrics.get("total_pnl", 0.0))
+    total_return_pct = metrics.get("total_return_pct")
     total_fees = float(metrics.get("total_fees_usd", 0.0))
+    completed_cnt = int(metrics.get("completed_trades", 0))
     pnl_color = "text-success" if total_pnl >= 0 else "text-danger"
-    fees_note = f" | Fees: ${total_fees:.2f}" if total_fees > 0 else ""
+
+    if is_alpaca_history:
+        ret_str = f" ({float(total_return_pct):+.2f}%)" if total_return_pct is not None else ""
+        pnl_sub = f"Since {start_date_esc}{ret_str}"
+        pnl_chart_title = f"Cumulative Portfolio P&amp;L ($) &mdash; Alpaca Official History (since {start_date_esc})"
+    else:
+        fees_note = f" | Fees: ${total_fees:.2f}" if total_fees > 0 else ""
+        pnl_sub = f"{completed_cnt} closed{fees_note}"
+        pnl_chart_title = "Cumulative Realized P&amp;L ($)"
+
+    if completed_cnt > 0:
+        win_rate_val = f"{metrics.get('win_rate', 0.0)}%"
+        win_rate_sub = f"Profit Factor: {metrics.get('profit_factor', 0.0)}"
+    else:
+        win_rate_val = "N/A"
+        win_rate_sub = "Orders migrating"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -312,7 +335,7 @@ def render_dashboard_html(telemetry: dict, metrics: dict) -> str:
             <div class="card p-3">
                 <div class="metric-title">Max Drawdown</div>
                 <div class="metric-value text-danger">{metrics.get("max_drawdown_pct", 0.0)}%</div>
-                <small class="text-secondary">${metrics.get("max_drawdown_dollars", 0.0):.2f} peak-to-trough</small>
+                <small class="text-secondary">${float(metrics.get("max_drawdown_dollars", 0.0)):,.2f} peak-to-trough</small>
             </div>
         </div>
         <div class="col-md-2 col-sm-4">
@@ -325,15 +348,15 @@ def render_dashboard_html(telemetry: dict, metrics: dict) -> str:
         <div class="col-md-2 col-sm-4">
             <div class="card p-3">
                 <div class="metric-title">Total Net P&amp;L</div>
-                <div class="metric-value {pnl_color}">${total_pnl:+.2f}</div>
-                <small class="text-secondary">{metrics.get("completed_trades", 0)} closed{fees_note}</small>
+                <div class="metric-value {pnl_color}">${total_pnl:+,.2f}</div>
+                <small class="text-secondary">{pnl_sub}</small>
             </div>
         </div>
         <div class="col-md-2 col-sm-4">
             <div class="card p-3">
                 <div class="metric-title">Win Rate</div>
-                <div class="metric-value text-success">{metrics.get("win_rate", 0.0)}%</div>
-                <small class="text-secondary">Profit Factor: {metrics.get("profit_factor", 0.0)}</small>
+                <div class="metric-value text-success">{win_rate_val}</div>
+                <small class="text-secondary">{win_rate_sub}</small>
             </div>
         </div>
         <div class="col-md-2 col-sm-4">
@@ -348,7 +371,7 @@ def render_dashboard_html(telemetry: dict, metrics: dict) -> str:
     <div class="row g-3 mb-4">
         <div class="col-lg-8">
             <div class="card p-3">
-                <h5 class="card-title h6 text-secondary mb-3">Cumulative Realized P&amp;L ($)</h5>
+                <h5 class="card-title h6 text-secondary mb-3">{pnl_chart_title}</h5>
                 <div class="chart-container">
                     <canvas id="pnlChart"></canvas>
                 </div>
@@ -398,7 +421,10 @@ def render_dashboard_html(telemetry: dict, metrics: dict) -> str:
         </div>
         <div class="col-md-8">
             <div class="card p-3">
-                <h6 class="text-secondary mb-3">Live Hunts &amp; Recent Execution History</h6>
+                <div class="d-flex flex-wrap justify-content-between align-items-center mb-3 gap-2">
+                    <h6 class="text-secondary mb-0">Live Hunts &amp; Recent Execution History</h6>
+                    <span class="badge bg-warning text-dark px-2 py-1" style="font-weight: 500;">&#9888; Dashboard migrated, we are still working on the orders</span>
+                </div>
                 <div class="table-responsive">
                     <table class="table table-dark table-hover table-striped align-middle mb-0">
                         <thead>

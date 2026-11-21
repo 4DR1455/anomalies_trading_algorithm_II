@@ -110,3 +110,91 @@ def compute_performance_metrics(
         "cumulative_pnl_series": [round(float(x), 2) for x in cumulative_pnl],
         "drawdown_series": [round(float(x), 2) for x in drawdown_pct_series],
     }
+
+
+def compute_portfolio_history_metrics(
+    portfolio_history: Dict[str, Any],
+    live_equity: float = None,
+    trades: List[Dict[str, Any]] = None,
+    risk_free_rate: float = 0.04,
+) -> Dict[str, Any]:
+    """
+    Computes official portfolio performance metrics and chart series directly from
+    Alpaca's GET /v2/account/portfolio/history response (filtering out pre-funding 0/null points
+    so the series starts cleanly at the account's first funded day, e.g. 2026-02-10).
+    """
+    from datetime import datetime, timezone
+
+    timestamps = portfolio_history.get("timestamp") or []
+    equities_raw = portfolio_history.get("equity") or []
+
+    points = []
+    for ts, eq in zip(timestamps, equities_raw):
+        if eq is not None and float(eq) > 0:
+            dt_str = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d")
+            points.append((dt_str, float(eq)))
+
+    # Update or append live equity for today so the curve stays real-time every 30s
+    if live_equity is not None and float(live_equity) > 0:
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if points and points[-1][0] == today_str:
+            points[-1] = (today_str, float(live_equity))
+        else:
+            points.append((today_str, float(live_equity)))
+
+    trade_metrics = compute_performance_metrics(trades or [], risk_free_rate=risk_free_rate)
+
+    if not points:
+        return trade_metrics
+
+    labels = [p[0] for p in points]
+    eq_arr = np.array([p[1] for p in points], dtype=np.float64)
+    start_equity = float(eq_arr[0])
+    current_equity = float(eq_arr[-1])
+
+    cum_pnl = eq_arr - start_equity
+    total_pnl = float(current_equity - start_equity)
+    total_return_pct = (total_pnl / start_equity * 100.0) if start_equity > 0 else 0.0
+
+    peaks = np.maximum.accumulate(eq_arr)
+    dd_dollars = peaks - eq_arr
+    dd_pct_series = np.where(peaks > 0, (peaks - eq_arr) / peaks * 100.0, 0.0)
+    max_dd_dollars = float(np.max(dd_dollars)) if len(dd_dollars) > 0 else 0.0
+    max_dd_pct = float(np.max(dd_pct_series)) if len(dd_pct_series) > 0 else 0.0
+
+    if len(eq_arr) > 1:
+        daily_returns = np.diff(eq_arr) / eq_arr[:-1]
+        daily_vol = float(np.std(daily_returns, ddof=1)) if len(daily_returns) > 1 else 0.0
+        annualized_vol_pct = daily_vol * np.sqrt(365.0) * 100.0
+        rf_daily = risk_free_rate / 365.0
+        sharpe_ratio = (
+            float((float(np.mean(daily_returns)) - rf_daily) / daily_vol * np.sqrt(365.0))
+            if daily_vol > 1e-10
+            else 0.0
+        )
+    else:
+        annualized_vol_pct = 0.0
+        sharpe_ratio = 0.0
+
+    return {
+        "source": "alpaca_portfolio_history",
+        "start_date": labels[0],
+        "start_equity": round(start_equity, 2),
+        "current_equity": round(current_equity, 2),
+        "total_return_pct": round(total_return_pct, 2),
+        "total_trades": trade_metrics["total_trades"],
+        "completed_trades": trade_metrics["completed_trades"],
+        "win_rate": trade_metrics["win_rate"],
+        "total_pnl": round(total_pnl, 2),
+        "total_fees_usd": trade_metrics.get("total_fees_usd", 0.0),
+        "sharpe_ratio": round(sharpe_ratio, 2),
+        "max_drawdown_pct": round(max_dd_pct, 2),
+        "max_drawdown_dollars": round(max_dd_dollars, 2),
+        "annualized_volatility": round(float(annualized_vol_pct), 2),
+        "avg_pnl_per_trade": trade_metrics["avg_pnl_per_trade"],
+        "profit_factor": trade_metrics["profit_factor"],
+        "chart_labels": labels,
+        "equity_series": [round(float(x), 2) for x in eq_arr],
+        "cumulative_pnl_series": [round(float(x), 2) for x in cum_pnl],
+        "drawdown_series": [round(float(x), 2) for x in dd_pct_series],
+    }

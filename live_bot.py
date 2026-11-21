@@ -33,7 +33,11 @@ from persistence import (
     LocalPersistenceStore,
     trim_hunts_preserving_active,
 )
-from metrics import CLOSED_TRADE_STATUSES, compute_performance_metrics
+from metrics import (
+    CLOSED_TRADE_STATUSES,
+    compute_performance_metrics,
+    compute_portfolio_history_metrics,
+)
 
 RUNNING = True
 
@@ -309,6 +313,10 @@ class AlpacaLiveClient:
     def close_position(self, symbol: str):
         pos_sym = symbol.replace("/", "")
         return self._request("DELETE", f"{self.endpoint}/positions/{pos_sym}")
+
+    def get_portfolio_history(self, period: str = "1A", timeframe: str = "1D") -> dict:
+        url = f"{self.endpoint}/account/portfolio/history?period={period}&timeframe={timeframe}"
+        return self._request("GET", url)
 
 
 class AdaptiveKalmanLive:
@@ -1156,8 +1164,8 @@ def main():
     # 1. Recover existing hunts from persistent store (preserving all active + last 50 completed)
     trades_history = store.load_hunts(max_count=50)
 
-    # 2. If empty, reconcile from Alpaca closed orders history
-    if not trades_history:
+    # 2. Optional legacy backfill only if explicitly enabled in params.json (default False on migrated accounts)
+    if not trades_history and params.get("backfill_closed_orders", False):
         try:
             closed_orders = client.get_closed_orders(symbol=symbol, limit=500, direction="desc")
             trades_history = store.reconcile_alpaca_orders(closed_orders, symbol=symbol, min_date=None)
@@ -1167,12 +1175,31 @@ def main():
         except Exception as e:
             print(f"[WARN] Reconciling closed orders from Alpaca: {e}")
 
-    # 3. Compute and persist initial metrics
-    metrics = compute_performance_metrics(trades_history)
+    # 3. Fetch official Alpaca portfolio equity history (1A / 1D) for authentic P&L & drawdown charts
+    portfolio_history: Dict[str, Any] = {}
+    last_ph_fetch = 0.0
+    ph_refresh_secs = 600.0
+    try:
+        portfolio_history = client.get_portfolio_history(period="1A", timeframe="1D")
+        last_ph_fetch = time.time()
+        print(f"📈 [PORTFOLIO HISTORY] Loaded {len(portfolio_history.get('equity') or [])} official Alpaca daily equity points.")
+    except Exception as e:
+        print(f"[WARN] Fetching Alpaca portfolio history: {e}")
+
+    def compute_current_metrics(live_eq: Optional[float] = None) -> Dict[str, Any]:
+        if portfolio_history and portfolio_history.get("equity"):
+            return compute_portfolio_history_metrics(portfolio_history, live_equity=live_eq, trades=trades_history)
+        return compute_performance_metrics(trades_history)
+
+    metrics = compute_current_metrics()
     store.save_metrics(metrics)
     total_realized_pnl = float(metrics.get("total_pnl", 0.0))
 
-    print(f"📦 [PERSISTENCE] Loaded: {len(trades_history)} hunts | Total Realized PnL: ${total_realized_pnl:+.2f} | Win Rate: {metrics.get('win_rate', 0.0)}% | Sharpe: {metrics.get('sharpe_ratio', 0.0)}")
+    print(
+        f"📦 [PERSISTENCE] Loaded: {len(trades_history)} hunts | "
+        f"Portfolio P&L (since {metrics.get('start_date', 'N/A')}): ${total_realized_pnl:+,.2f} | "
+        f"Max DD: {metrics.get('max_drawdown_pct', 0.0)}% | Sharpe: {metrics.get('sharpe_ratio', 0.0)}"
+    )
 
     while RUNNING:
         cycle_start = time.time()
@@ -1180,6 +1207,14 @@ def main():
         now_str = now_dt.isoformat()
 
         try:
+            # Periodically refresh official Alpaca portfolio history (every 10 minutes)
+            if time.time() - last_ph_fetch >= ph_refresh_secs:
+                try:
+                    portfolio_history = client.get_portfolio_history(period="1A", timeframe="1D")
+                    last_ph_fetch = time.time()
+                except Exception as phe:
+                    print(f"   [Warn] Refreshing Alpaca portfolio history: {phe}")
+
             # 1. Fetch live quote & update Adaptive 1D Kalman Filter first (needed for orphan exit pricing)
             quote = client.get_latest_quote(symbol)
             bid = float(quote["bp"])
@@ -1202,12 +1237,14 @@ def main():
                 store=store,
             )
 
+            live_eq_now = broker_telemetry.get("broker_account", {}).get("equity")
             if pending_updated:
                 trades_history = trim_hunts_preserving_active(trades_history, max_count=50)
-                metrics = compute_performance_metrics(trades_history)
                 store.save_hunts(trades_history, max_count=50)
-                store.save_metrics(metrics)
-                total_realized_pnl = float(metrics.get("total_pnl", 0.0))
+
+            metrics = compute_current_metrics(live_eq=live_eq_now)
+            store.save_metrics(metrics)
+            total_realized_pnl = float(metrics.get("total_pnl", 0.0))
 
             recon = broker_telemetry["reconciliation"]
             sync_badge = "SYNCED" if recon["is_synced"] else f"DRIFT={recon['untracked_qty']:+.4f}"
@@ -1368,23 +1405,7 @@ def main():
                                 print(f"   ⚠️ [EXIT DEFERRED] Hunt {trade_rec['id']} persisted as exit_submit_pending; will auto-retry next cycle.")
 
                             # Recompute and persist metrics and hunts
-                            metrics = compute_performance_metrics(trades_history)
                             store.save_hunts(trades_history, max_count=50)
-                            store.save_metrics(metrics)
-                            total_realized_pnl = float(metrics.get("total_pnl", 0.0))
-
-                            if trade_rec["status"] == "completed":
-                                print(
-                                    f"   💰 [EXIT FILLED] SELL {format_order_qty(trade_rec['qty'], is_crypto)} @ ${trade_rec['sell_price']:.2f} "
-                                    f"(Net PnL: ${trade_rec['pnl']:+.2f} | Total: ${total_realized_pnl:+.2f})"
-                                )
-                            elif trade_rec["status"] == "open_exit_pending":
-                                print(
-                                    f"   ⏳ [EXIT PLACED] SELL {format_order_qty(trade_rec['qty'], is_crypto)} @ ${exit_price:.2f} "
-                                    f"(Status: open_exit_pending | Order ID: {trade_rec['sell_order_id']})"
-                                )
-
-                            # Refresh broker telemetry immediately so telemetry.json mirrors the new position
                             try:
                                 acc_post = client.get_account()
                                 pos_post = client.get_positions(symbol)
@@ -1392,6 +1413,20 @@ def main():
                                 broker_telemetry = build_broker_telemetry(acc_post, pos_post, open_post, trades_history)
                             except Exception:
                                 pass
+                            metrics = compute_current_metrics(live_eq=broker_telemetry.get("broker_account", {}).get("equity"))
+                            store.save_metrics(metrics)
+                            total_realized_pnl = float(metrics.get("total_pnl", 0.0))
+
+                            if trade_rec["status"] == "completed":
+                                print(
+                                    f"   💰 [EXIT FILLED] SELL {format_order_qty(trade_rec['qty'], is_crypto)} @ ${trade_rec['sell_price']:.2f} "
+                                    f"(Net PnL: ${trade_rec['pnl']:+.2f} | Portfolio P&L: ${total_realized_pnl:+,.2f})"
+                                )
+                            elif trade_rec["status"] == "open_exit_pending":
+                                print(
+                                    f"   ⏳ [EXIT PLACED] SELL {format_order_qty(trade_rec['qty'], is_crypto)} @ ${exit_price:.2f} "
+                                    f"(Status: open_exit_pending | Order ID: {trade_rec['sell_order_id']})"
+                                )
                         else:
                             print("   ⏱️ [UNFILLED] 20s timeout expired. Remainder canceled. 0 shares bought.")
 

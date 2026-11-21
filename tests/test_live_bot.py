@@ -420,6 +420,30 @@ class TestLiveBotFixes(unittest.TestCase):
         self.assertEqual(format_order_qty(0.00001, is_crypto=True), "0.00001")
         self.assertEqual(floor_qty(1.9999999999, 9), 1.999999999)
 
+    def test_compute_portfolio_history_metrics_matches_alpaca_curve(self):
+        from dashboard.metrics import compute_portfolio_history_metrics
+
+        ph = {
+            "timestamp": [
+                1770595200,  # 2026-02-09 (pre-funding 0)
+                1770681600,  # 2026-02-10 ($100,000)
+                1770768000,  # 2026-02-11 ($120,000)
+                1770854400,  # 2026-02-12 ($108,000 -> -10% DD / -$12,000)
+                1770940800,  # 2026-02-13 ($150,000)
+            ],
+            "equity": [0.0, 100000.0, 120000.0, 108000.0, 150000.0],
+        }
+        m = compute_portfolio_history_metrics(ph, live_equity=None, trades=[])
+        self.assertEqual(m["source"], "alpaca_portfolio_history")
+        self.assertEqual(m["start_date"], "2026-02-10")
+        self.assertEqual(m["total_pnl"], 50000.0)
+        self.assertEqual(m["total_return_pct"], 50.0)
+        self.assertEqual(m["max_drawdown_pct"], 10.0)
+        self.assertEqual(m["max_drawdown_dollars"], 12000.0)
+        self.assertEqual(m["cumulative_pnl_series"], [0.0, 20000.0, 8000.0, 50000.0])
+        self.assertEqual(m["chart_labels"], ["2026-02-10", "2026-02-11", "2026-02-12", "2026-02-13"])
+        self.assertGreater(m["sharpe_ratio"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
