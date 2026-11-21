@@ -7,15 +7,26 @@ from typing import Dict, Any, List
 import numpy as np
 
 
-def compute_performance_metrics(trades: List[Dict[str, Any]], risk_free_rate: float = 0.04) -> Dict[str, Any]:
+CLOSED_TRADE_STATUSES = {"completed", "liquidated_stale", "liquidated_manual", "liquidated_orphan"}
+
+
+def compute_performance_metrics(
+    trades: List[Dict[str, Any]],
+    risk_free_rate: float = 0.04,
+    base_equity: float = 100000.0,
+) -> Dict[str, Any]:
     """
     Computes rigorous portfolio metrics on trade history using numpy.
     
     :param trades: List of trade dictionaries containing 'pnl', 'pnl_pct', 'buy_price', 'qty', etc.
     :param risk_free_rate: Annualized risk-free rate (default 4.0%)
+    :param base_equity: Starting account equity used as denominator for drawdown percentage (default $100,000)
     :return: Dictionary containing Sharpe Ratio, Max Drawdown, Volatility, Win Rate, etc.
     """
-    completed_trades = [t for t in trades if t.get("pnl") is not None and t.get("status") == "completed"]
+    completed_trades = [
+        t for t in trades
+        if t.get("pnl") is not None and t.get("status") in CLOSED_TRADE_STATUSES
+    ]
 
     if not completed_trades:
         return {
@@ -23,6 +34,7 @@ def compute_performance_metrics(trades: List[Dict[str, Any]], risk_free_rate: fl
             "completed_trades": 0,
             "win_rate": 0.0,
             "total_pnl": 0.0,
+            "total_fees_usd": 0.0,
             "sharpe_ratio": 0.0,
             "max_drawdown_pct": 0.0,
             "max_drawdown_dollars": 0.0,
@@ -35,6 +47,7 @@ def compute_performance_metrics(trades: List[Dict[str, Any]], risk_free_rate: fl
 
     pnls = np.array([float(t["pnl"]) for t in completed_trades], dtype=np.float64)
     returns = np.array([float(t.get("pnl_pct", 0.0)) for t in completed_trades], dtype=np.float64)
+    total_fees_usd = sum(float(t.get("fees_usd") or 0.0) for t in completed_trades)
 
     # 1. Cumulative P&L Series & Peak Tracking
     cumulative_pnl = np.cumsum(pnls)
@@ -42,11 +55,11 @@ def compute_performance_metrics(trades: List[Dict[str, Any]], risk_free_rate: fl
     drawdowns_dollars = peaks - cumulative_pnl
     max_drawdown_dollars = float(np.max(drawdowns_dollars)) if len(drawdowns_dollars) > 0 else 0.0
 
-    # Drawdown percentage relative to peak equity (assuming base capital $10,000 for equity normalization)
-    base_equity = 10000.0
-    equity_curve = base_equity + cumulative_pnl
+    # Drawdown percentage relative to peak equity
+    safe_base = base_equity if base_equity > 0 else 100000.0
+    equity_curve = safe_base + cumulative_pnl
     equity_peaks = np.maximum.accumulate(equity_curve)
-    drawdown_pct_series = (equity_peaks - equity_curve) / equity_peaks * 100.0
+    drawdown_pct_series = np.where(equity_peaks > 0, (equity_peaks - equity_curve) / equity_peaks * 100.0, 0.0)
     max_drawdown_pct = float(np.max(drawdown_pct_series)) if len(drawdown_pct_series) > 0 else 0.0
 
     # 2. Volatility (Annualized based on ~252 trading days, ~6.5 hours/day, 30s bars => ~780 cycles/day)
@@ -87,6 +100,7 @@ def compute_performance_metrics(trades: List[Dict[str, Any]], risk_free_rate: fl
         "completed_trades": len(completed_trades),
         "win_rate": round(win_rate, 2),
         "total_pnl": round(float(np.sum(pnls)), 2),
+        "total_fees_usd": round(total_fees_usd, 2),
         "sharpe_ratio": round(sharpe_ratio, 2),
         "max_drawdown_pct": round(max_drawdown_pct, 2),
         "max_drawdown_dollars": round(max_drawdown_dollars, 2),

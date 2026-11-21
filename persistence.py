@@ -43,6 +43,31 @@ def safe_read_json(filepath: Path, default: Any = None) -> Any:
         return default
 
 
+ACTIVE_HUNT_STATUSES = {"open_exit_pending", "exit_submit_pending", "exit_partially_filled"}
+
+
+def trim_hunts_preserving_active(hunts: List[Dict[str, Any]], max_count: int = 50) -> List[Dict[str, Any]]:
+    """
+    Trims hunt history to the latest max_count terminal hunts while ALWAYS preserving
+    every active/non-terminal hunt so pending exits are never silently evicted.
+    Maintains original chronological ordering.
+    """
+    if not hunts:
+        return []
+
+    active_indices = set()
+    terminal_indices = []
+    for idx, h in enumerate(hunts):
+        if h.get("status") in ACTIVE_HUNT_STATUSES:
+            active_indices.add(idx)
+        else:
+            terminal_indices.append(idx)
+
+    kept_terminal = set(terminal_indices[-max_count:]) if max_count > 0 else set()
+    kept = active_indices | kept_terminal
+    return [h for idx, h in enumerate(hunts) if idx in kept]
+
+
 class LocalPersistenceStore:
     def __init__(self, data_dir: Path):
         self.data_dir = Path(data_dir)
@@ -55,27 +80,28 @@ class LocalPersistenceStore:
         """
         Loads market hunts from local persistent storage.
         Checks hunts_history.json first, falls back to telemetry.json.
-        Returns up to the last max_count trades (default 50).
+        Preserves all active/open hunts plus up to the last max_count completed trades (default 50).
         """
         # 1. Primary store: hunts_history.json
         hunts = safe_read_json(self.hunts_file)
         if isinstance(hunts, list) and len(hunts) > 0:
-            return hunts[-max_count:]
+            return trim_hunts_preserving_active(hunts, max_count=max_count)
 
         # 2. Fallback: telemetry.json trades array
         telemetry = safe_read_json(self.telemetry_file)
         if isinstance(telemetry, dict):
             trades = telemetry.get("trades")
             if isinstance(trades, list) and len(trades) > 0:
+                trimmed = trim_hunts_preserving_active(trades, max_count=max_count)
                 # Migrate recovered trades into hunts_history.json immediately
-                self.save_hunts(trades, max_count=max_count)
-                return trades[-max_count:]
+                self.save_hunts(trimmed, max_count=max_count)
+                return trimmed
 
         return []
 
     def save_hunts(self, hunts: List[Dict[str, Any]], max_count: int = 50) -> None:
-        """Atomically persists the market hunts list, capped to the last max_count (50)."""
-        rolling_hunts = hunts[-max_count:] if hunts else []
+        """Atomically persists the market hunts list, preserving all active hunts plus the last max_count completed."""
+        rolling_hunts = trim_hunts_preserving_active(hunts, max_count=max_count) if hunts else []
         atomic_write_json(self.hunts_file, rolling_hunts)
 
     def load_metrics(self) -> Dict[str, Any]:
@@ -108,19 +134,19 @@ class LocalPersistenceStore:
         atomic_write_json(self.metrics_file, metrics_copy)
 
     def save_telemetry_snapshot(self, snapshot: Dict[str, Any], hunts: List[Dict[str, Any]], metrics: Dict[str, Any]) -> None:
-        """Atomically writes telemetry snapshot embedding the persistent last 50 hunts and metrics."""
+        """Atomically writes telemetry snapshot embedding all active hunts + last 50 completed hunts and metrics."""
         snap = dict(snapshot)
-        snap["trades"] = hunts[-50:]
+        snap["trades"] = trim_hunts_preserving_active(hunts, max_count=50)
         snap["metrics"] = metrics
         atomic_write_json(self.telemetry_file, snap)
 
     def record_hunt(self, hunt: Dict[str, Any], compute_metrics_fn=None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
-        Appends a new market hunt, trims to 50, updates metrics, and persists all stores.
+        Appends a new market hunt, trims preserving active hunts, updates metrics, and persists all stores.
         """
         hunts = self.load_hunts(max_count=50)
         hunts.append(hunt)
-        hunts = hunts[-50:]
+        hunts = trim_hunts_preserving_active(hunts, max_count=50)
         self.save_hunts(hunts, max_count=50)
 
         if compute_metrics_fn:
@@ -142,7 +168,8 @@ class LocalPersistenceStore:
         if local history was cleared or uninitialized.
         Filters strictly for active algorithm deployment orders (client_order_id containing 'hunt-'
         or timestamps >= min_date) and performs temporal FIFO order reconciliation (< 24h duration)
-        with accurate sell timestamps and realized PnL calculations.
+        with strict quantity compatibility (allowing 0.15%-0.50% crypto buy-fee deduction)
+        so orphaned buys can never shift or cross-pair unrelated sells.
         """
         def parse_iso(ts_str: Optional[str]) -> Optional[datetime]:
             if not ts_str:
@@ -155,6 +182,14 @@ class LocalPersistenceStore:
                 return dt
             except Exception:
                 return None
+
+        def qty_matches(b_qty: float, s_qty: float) -> bool:
+            if b_qty <= 0 or s_qty <= 0:
+                return False
+            # Accept exact qty OR fee-deducted net crypto qty (up to 0.50% below buy qty)
+            lower = b_qty * 0.995 - 1e-4
+            upper = b_qty * 1.0005 + 1e-4
+            return lower <= s_qty <= upper
 
         buys = []
         sells = []
@@ -195,40 +230,44 @@ class LocalPersistenceStore:
             b_qty = float(b.get("filled_qty") or 0.0)
             matched_idx = None
 
-            # Pass 1: Match sell created shortly after buy fill (within 10m) with matching quantity
+            # Pass 1: Match sell created shortly after buy fill (within 10m) with compatible quantity
             for s_idx, (s_f_time, s_c_time, s) in enumerate(sells):
                 if s_idx in used_sells:
                     continue
                 s_qty = float(s.get("filled_qty") or 0.0)
                 if s_f_time >= b_f_time and (s_f_time - b_f_time) < timedelta(hours=24):
-                    if abs(s_qty - b_qty) < 1e-4 and s_c_time >= b_f_time - timedelta(seconds=30) and (s_c_time - b_f_time) < timedelta(minutes=10):
+                    if qty_matches(b_qty, s_qty) and s_c_time >= b_f_time - timedelta(seconds=30) and (s_c_time - b_f_time) < timedelta(minutes=10):
                         matched_idx = s_idx
                         break
 
-            # Pass 2: Strict temporal FIFO fallback (< 24h holding duration)
+            # Pass 2: Strict temporal FIFO fallback (< 24h holding duration) STILL requiring quantity compatibility
             if matched_idx is None:
                 for s_idx, (s_f_time, s_c_time, s) in enumerate(sells):
                     if s_idx in used_sells:
                         continue
-                    if s_f_time >= b_f_time and (s_f_time - b_f_time) < timedelta(hours=24):
+                    s_qty = float(s.get("filled_qty") or 0.0)
+                    if s_f_time >= b_f_time and (s_f_time - b_f_time) < timedelta(hours=24) and qty_matches(b_qty, s_qty):
                         matched_idx = s_idx
                         break
 
             if matched_idx is not None:
                 used_sells.add(matched_idx)
                 s = sells[matched_idx][2]
+                s_qty = float(s.get("filled_qty") or b_qty)
                 b_price = float(b.get("filled_avg_price") or b.get("limit_price") or 0.0)
                 s_price = float(s.get("filled_avg_price") or s.get("limit_price") or 0.0)
-                qty = b_qty
-                pnl = round((s_price - b_price) * qty, 2)
-                pnl_pct = round((s_price - b_price) / b_price, 4) if b_price > 0 else 0.0
+                cost_basis = b_price * b_qty
+                proceeds = s_price * s_qty
+                pnl = round(proceeds - cost_basis, 2)
+                pnl_pct = round(pnl / cost_basis, 4) if cost_basis > 0 else 0.0
 
                 hunts.append({
                     "id": str(b.get("id", ""))[:8],
                     "symbol": symbol,
                     "buy_order_id": b.get("id"),
                     "sell_order_id": s.get("id"),
-                    "qty": qty,
+                    "buy_qty": b_qty,
+                    "qty": s_qty,
                     "buy_price": b_price,
                     "sell_price": s_price,
                     "pnl": pnl,

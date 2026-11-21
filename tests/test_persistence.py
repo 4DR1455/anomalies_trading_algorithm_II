@@ -182,6 +182,48 @@ class TestLocalPersistence(unittest.TestCase):
         hunts = LocalPersistenceStore.reconcile_alpaca_orders(mock_orders, symbol="SOL/USD")
         self.assertEqual(len(hunts), 0)
 
+    def test_active_hunts_never_evicted_by_50_cap(self):
+        """Verify open_exit_pending / exit_submit_pending hunts are NEVER evicted even after 60 completed trades."""
+        hunts = [
+            {"id": "open-1", "symbol": "SOL/USD", "qty": 111.2966, "pnl": None, "status": "open_exit_pending"},
+            {"id": "submit-1", "symbol": "SOL/USD", "qty": 50.0, "pnl": None, "status": "exit_submit_pending"},
+        ] + [
+            {"id": f"done-{i}", "symbol": "SOL/USD", "qty": 1.0, "pnl": 1.0, "status": "completed"}
+            for i in range(60)
+        ]
+        self.store.save_hunts(hunts, max_count=50)
+        loaded = self.store.load_hunts(max_count=50)
+
+        ids = [h["id"] for h in loaded]
+        self.assertIn("open-1", ids)
+        self.assertIn("submit-1", ids)
+        # 2 active + 50 latest completed = 52 total, oldest completed done-0..done-9 trimmed
+        self.assertEqual(len(loaded), 52)
+        self.assertNotIn("done-0", ids)
+        self.assertIn("done-59", ids)
+
+    def test_alpaca_reconciliation_prevents_quantity_mismatch_cascade(self):
+        """
+        Reproduces the Nov 18-19 FIFO cascade bug: an orphaned buy MUST NOT steal a different-qty sell,
+        while a fee-adjusted crypto sell (0.15% below buy_qty) MUST still match its corresponding buy.
+        """
+        mock_orders = [
+            # Orphaned 1.0 SOL buy (no matching sell)
+            {"id": "orphan-1", "symbol": "SOL/USD", "side": "buy", "filled_qty": "1.0", "filled_avg_price": "74.77", "filled_at": "2026-11-18T01:00:00Z", "created_at": "2026-11-18T01:00:00Z"},
+            # Real trade 1: bought 7.067 SOL, sold fee-adjusted 7.0563995 SOL
+            {"id": "b-big", "symbol": "SOL/USD", "side": "buy", "filled_qty": "7.067", "filled_avg_price": "72.30", "filled_at": "2026-11-18T22:49:11Z", "created_at": "2026-11-18T22:49:00Z"},
+            {"id": "s-big", "symbol": "SOL/USD", "side": "sell", "filled_qty": "7.0563995", "filled_avg_price": "72.65", "filled_at": "2026-11-18T23:30:00Z", "created_at": "2026-11-18T22:49:25Z"},
+            # Real trade 2: small 0.2788 SOL buy + sell
+            {"id": "b-small", "symbol": "SOL/USD", "side": "buy", "filled_qty": "0.2788", "filled_avg_price": "72.95", "filled_at": "2026-11-19T01:31:36Z", "created_at": "2026-11-19T01:31:20Z"},
+            {"id": "s-small", "symbol": "SOL/USD", "side": "sell", "filled_qty": "0.2788", "filled_avg_price": "73.12", "filled_at": "2026-11-19T01:39:11Z", "created_at": "2026-11-19T01:31:45Z"},
+        ]
+        hunts = LocalPersistenceStore.reconcile_alpaca_orders(mock_orders, symbol="SOL/USD")
+        self.assertEqual(len(hunts), 2)
+        self.assertEqual(hunts[0]["buy_order_id"], "b-big")
+        self.assertEqual(hunts[0]["sell_order_id"], "s-big")
+        self.assertEqual(hunts[1]["buy_order_id"], "b-small")
+        self.assertEqual(hunts[1]["sell_order_id"], "s-small")
+
 
 if __name__ == "__main__":
     unittest.main()

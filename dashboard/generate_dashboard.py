@@ -65,27 +65,38 @@ def load_telemetry(data_dir: Path) -> dict:
 
 def render_html(telemetry: dict, metrics: dict, output_path: Path):
     trades = telemetry.get("trades", [])
+    active_statuses = {"open_exit_pending", "exit_submit_pending", "exit_partially_filled"}
+    active_list = [t for t in trades if t.get("status") in active_statuses]
+    terminal_list = [t for t in trades if t.get("status") not in active_statuses][-50:]
+    ordered_trades = list(reversed(active_list)) + list(reversed(terminal_list))
+
     trades_rows = []
-    for t in reversed(trades[-50:]):
+    for t in ordered_trades:
         status = t.get("status", "unknown")
         badge_class = {
             "completed": "badge-success",
             "open_exit_pending": "badge-warning",
+            "exit_partially_filled": "badge-info",
+            "exit_submit_pending": "badge-danger",
             "liquidated_stale": "badge-danger",
+            "liquidated_manual": "badge-secondary",
+            "liquidated_orphan": "badge-danger",
         }.get(status, "badge-info")
 
         pnl = t.get("pnl")
         pnl_str = f"${pnl:+.2f}" if pnl is not None else "Pending"
-        pnl_class = "text-success" if pnl and pnl > 0 else ("text-danger" if pnl and pnl < 0 else "text-muted")
+        pnl_class = "text-success" if pnl is not None and pnl > 0 else ("text-danger" if pnl is not None and pnl < 0 else "text-muted")
 
         buy_time = t.get("buy_timestamp", "")[:19].replace("T", " ")
         sell_time = t.get("sell_timestamp", "")[:19].replace("T", " ") if t.get("sell_timestamp") else "-"
+        qty_val = float(t.get("qty") or 0.0)
+        qty_str = f"{qty_val:.6f}".rstrip("0").rstrip(".") if abs(qty_val) >= 1e-9 else "0"
 
         trades_rows.append(f"""
         <tr>
             <td><code>{t.get('id', '')[:8]}</code></td>
             <td><strong>{t.get('symbol', '')}</strong></td>
-            <td>{t.get('qty', 0)}</td>
+            <td>{qty_str}</td>
             <td>${t.get('buy_price', 0.0):.2f}</td>
             <td>${t.get('sell_price', 0.0):.2f}</td>
             <td class="{pnl_class}"><strong>{pnl_str}</strong></td>
