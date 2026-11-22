@@ -6,11 +6,6 @@
 
 </div>
 
-> ### 🌐 Live Quantitative Dashboard (Real-Time Telemetry)
-> **Access the live, autonomous trading bot operating 24/7 on Alpaca Paper Trading:**  
-> 👉 **[https://adria-trading-bot.duckdns.org/](https://adria-trading-bot.duckdns.org/)**  
-> *(Publicly accessible without credentials. Fully responsive on desktop, tablet, and mobile with SSL/TLS encryption).*
-
 ---
 
 ## 💡 Value Proposition & Bot Strategy
