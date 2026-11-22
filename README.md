@@ -13,6 +13,43 @@
 
 ---
 
+## 💡 Value Proposition & Bot Strategy
+
+### The Problem
+
+When you look at a stock market chart, you will frequently see prices **drop** and then **recover**. What is easy to overlook is that these recurring pullbacks cost far more compounded value than is obvious at first glance. Consider a simple example:
+
+* Take two assets, **Stock A** and **Stock B**, both starting at **<span>$</span>100**.
+* Each time unit (`tu`), both normally increase in price by **1%**.
+* Every 3rd time unit, however, **Stock A** drops by **1%** instead of growing.
+
+At first glance, an occasional 1% dip may not seem like a major issue. Once you run the compounding math over **100 tu**, the impact becomes clear:
+
+* After **100 tu**, **Stock A** reaches **~<span>$</span>138.87**, whereas **Stock B** reaches **~<span>$</span>270.48**:
+
+$$
+P_A(100) = \$100 \times \left(1.01^2 \times 0.99\right)^{100/3} \approx \$138.87
+$$
+
+$$
+P_B(100) = \$100 \times 1.01^{100} \approx \$270.48
+$$
+
+As you can see, **Stock B** ends up nearly **2× higher** in price than **Stock A**—meaning a recurring dip occurring just one-third of the time erodes roughly **half of the final portfolio value** (and over three-quarters of the net profit).
+
+### The Strategy & Purpose
+
+Given this compounding drag, the core idea behind this bot is to hold dedicated cash reserves specifically to capitalize on these temporary price inefficiencies—what I call **single-stock market anomalies** (or simply **anomalies**). Whenever an anomaly occurs, the engine executes a **"Market Hunt"**: buying at the undervalued dip and selling once the price reverts to its expected fair value—the price it would have traded at without the inefficiency.
+
+> [!IMPORTANT]
+> This strategy aims solely to extract profit from temporary market inefficiencies rather than lose returns to them. It is a focused anomaly-harvesting strategy—**not** a holistic combined strategy.
+
+### Empirical Validation
+
+Based on prior research and prototyping, systematically capturing these short-term inefficiencies is viable and profitable. The earlier study and prototype can be found in [Microtrading_bot](https://github.com/4DR1455/Microtrading_bot).
+
+---
+
 ## 🏗 System Architecture
 
 The v2.0 system follows a strict "Separation of Concerns" principle to maximize runtime resilience, eliminate IPC fragility, and guarantee zero crashes.
@@ -68,13 +105,13 @@ flowchart TD
   * Employs compile-time memory safety, strict non-blocking async I/O (`reqwest` with pure `rustls`), and atomic file checkpointing (`fsync`).
 * **Strategy Brain (Adaptive 1D Kalman Filter):**
   * State-space latent fair-price estimator replacing fixed-alpha EMAs.
-  * Microstructure-adaptive measurement variance $R_t$ dynamically filters out bid-ask bounce noise.
+  * Microstructure-adaptive measurement variance $`R_t`$ dynamically filters out bid-ask bounce noise.
   * Myers-Tapley innovation variance tracking dynamically collapses lag during genuine price trends.
 * **Execution & Hygiene Manager ("HiddenMM"):**
-  * **Maker Queue Priority:** Places limit BUY orders at Best Bid + $0.01 when spread $\ge 2$ ticks, capturing top queue priority without crossing the ask.
+  * **Maker Queue Priority:** Places limit BUY orders at Best Bid + <span>$</span>0.01 when spread $`\ge 2`$ ticks, capturing top queue priority without crossing the ask.
   * **20-Second Timeout:** Cancels remaining unfilled shares after 20 seconds, preventing stale order lockup.
   * **Partial Fill Recovery:** Tracks partial executions and immediately submits an exit limit SELL order at the predicted fair price for the exact filled quantity.
-  * **12-Hour Stale Liquidation:** Checks open orders continuously; any order open $> 12$ hours is canceled and liquidated at market price.
+  * **12-Hour Stale Liquidation:** Checks open orders continuously; any order open $`> 12`$ hours is canceled and liquidated at market price.
 * **Analytics Dashboard (Python 3 + NumPy):**
   * Reads real-time telemetry snapshots without exposing network ports to the public internet.
   * Calculates **Sharpe Ratio**, **Max Drawdown**, **Volatility**, **Win Rate**, and **P&L** on historical and live trades.
@@ -87,59 +124,69 @@ flowchart TD
 
 ### 1. Market Cycle & Anomaly Detection (Every 30 Seconds)
 
-Every 30 seconds, the engine queries the latest National Best Bid and Offer (NBBO) quote $(B_t, A_t)$, computes mid-price $z_t = \frac{1}{2}(B_t + A_t)$, and updates the Kalman state:
+Every 30 seconds, the engine queries the latest National Best Bid and Offer (NBBO) quote $`(B_t, A_t)`$, computes mid-price $`z_t = \frac{1}{2}(B_t + A_t)`$, and updates the Kalman state:
 
-1. **Prior Prediction:** $\hat{x}_{t|t-1} = \hat{x}_{t-1|t-1}, \quad P_{t|t-1} = P_{t-1|t-1} + Q_{t-1}$
-2. **Spread-Adaptive Measurement Noise:** $R_t = r_{\text{base}} \cdot z_t^2 + \gamma_s \left(\frac{A_t - B_t}{2}\right)^2$
-3. **Innovation & Mispricing Ratio:** $\nu_t = z_t - \hat{x}_{t|t-1}, \quad m_t = \frac{\hat{x}_{t|t-1} - z_t}{\hat{x}_{t|t-1}}$
+1. **Prior Prediction:** $`\hat{x}_{t|t-1} = \hat{x}_{t-1|t-1}, \quad P_{t|t-1} = P_{t-1|t-1} + Q_{t-1}`$
+2. **Spread-Adaptive Measurement Noise:** $`R_t = r_{\text{base}} \cdot z_t^2 + \gamma_s \left(\frac{A_t - B_t}{2}\right)^2`$
+3. **Innovation & Mispricing Ratio:** $`\nu_t = z_t - \hat{x}_{t|t-1}, \quad m_t = \frac{\hat{x}_{t|t-1} - z_t}{\hat{x}_{t|t-1}}`$
 
 ### 2. Thresholding & Circuit Breaker
 
-* **Buy Signal:** Triggered when $m_t \ge m_{\min}$ (where $m_{\min}$ is `min_margin`, undervaluation anomaly detected).
-* **Circuit Breaker / Volatility Ceiling (`max_margin`):** If $m_t > m_{\max}$ (where $m_{\max}$ is `max_margin`, e.g., flash crash or news dump), **trading halts immediately**. The state update is heavily gated to prevent poisoning the filter with extreme anomalies.
+* **Buy Signal:** Triggered when $`m_t \ge m_{\min}`$ (where $`m_{\min}`$ is `min_margin`, undervaluation anomaly detected).
+* **Circuit Breaker / Volatility Ceiling (`max_margin`):** If $`m_t > m_{\max}`$ (where $`m_{\max}`$ is `max_margin`, e.g., flash crash or news dump), **trading halts immediately**. The state update is heavily gated to prevent poisoning the filter with extreme anomalies.
 
 ### 3. Dynamic Position Sizing & Portfolio Equity Allocation
 
-Instead of arbitrary fixed share lots, capital allocation scales dynamically as a proportion of total portfolio equity $W_t$, governed by the normalized anomaly factor and execution liquidity constraints:
+Instead of arbitrary fixed share lots, capital allocation scales dynamically as a proportion of total portfolio equity $`W_t`$, governed by the normalized anomaly factor and execution liquidity constraints:
 
-$$\text{Factor}(x) = 1 - \left(1 - x^{\text{level}}\right)^{\frac{1}{\text{level}}}$$
+$$
+\text{Factor}(x) = 1 - \left(1 - x^{\text{level}}\right)^{\frac{1}{\text{level}}}
+$$
 
-$$\text{Target Capital} = \text{Factor}(x) \times (W_t \times S)$$
+$$
+\text{Target Capital} = \text{Factor}(x) \times (W_t \times S)
+$$
 
-$$\text{Allocated Capital} = \min(\text{Target Capital}, \; \text{Available Cash})$$
+$$
+\text{Allocated Capital} = \min(\text{Target Capital}, \; \text{Available Cash})
+$$
 
-$$\text{Shares / Units} = \mathrm{round}\left(\frac{\text{Allocated Capital}}{P_{\text{buy}}}, \; 4\right)$$
+$$
+\text{Shares / Units} = \mathrm{round}\left(\frac{\text{Allocated Capital}}{P_{\text{buy}}}, \; 4\right)
+$$
 
 *Where:*
-* $x$: Normalized deviation ratio scaled between `min_margin` ($m_{\min}$) and `max_margin` ($m_{\max}$): $x = \mathrm{clamp}\left(\frac{m_t - m_{\min}}{m_{\max} - m_{\min}},\, 0,\, 1\right)$.
-* $S$: Maximum equity proportion parameter (`max_shares` $\in (0, 1.0]$). For example, $S = 0.20$ limits any single trade to at most 20% of total portfolio equity, while $S = 1.0$ authorizes up to 100% of available capital when no other positions are active.
-* $W_t$: Real-time portfolio equity reported by Alpaca (`client.get_account().equity`).
-* $\text{Available Cash}$: Cash currently idle in the account. To prevent unphysical asymptotic lockups, if remaining cash is less than the calculated target capital, the algorithm directly deploys all available remaining cash: $\min(\text{Target Capital}, \; \text{Cash})$.
+* $`x`$: Normalized deviation ratio scaled between `min_margin` ($`m_{\min}`$) and `max_margin` ($`m_{\max}`$): $`x = \mathrm{clamp}\left(\frac{m_t - m_{\min}}{m_{\max} - m_{\min}},\, 0,\, 1\right)`$.
+* $`S`$: Maximum equity proportion parameter (`max_shares` $`\in (0, 1.0]`$). For example, $`S = 0.20`$ limits any single trade to at most 20% of total portfolio equity, while $`S = 1.0`$ authorizes up to 100% of available capital when no other positions are active.
+* $`W_t`$: Real-time portfolio equity reported by Alpaca (`client.get_account().equity`).
+* $`\text{Available Cash}`$: Cash currently idle in the account. To prevent unphysical asymptotic lockups, if remaining cash is less than the calculated target capital, the algorithm directly deploys all available remaining cash: $`\min(\text{Target Capital}, \; \text{Cash})`$.
 * Fractional crypto support: Solana (`SOL/USD`) is sized with 4 decimal places of precision (`round(qty, 4)`).
 
 ---
 
 ### 4. Empirical Anomaly Calibration & 3-Hour Profit Optimization
 
-To determine the mathematically optimal value for `max_shares` ($S$), the live production environment on the GCP remote server (`35.239.201.102`) was calibrated using historical systemd execution logs:
+To determine the mathematically optimal value for `max_shares` ($`S`$), the live production environment on the GCP remote server (`35.239.201.102`) was calibrated using historical systemd execution logs:
 
-* **Production Observation Sample:** $N_{\text{cycles}} = 484$ consecutive 30-second cycles ($4.03$ hours).
-* **Empirical Anomaly Count:** $N_{\text{anomalies}} = 50$ market hunt undervaluation anomalies detected.
-* **Anomaly Probability per Cycle:** $p = \frac{50}{484} = 0.10331$ ($10.33\%$ per 30s cycle, recurring once every $9.68$ cycles $\approx 290.4$s $\approx 4.84$ min).
-* **Maker Order Fill Rate (20s timeout):** $P_{\text{fill}} = \frac{26}{50} = 52.0\%$.
-* **Mean Realized Return per Trade:** $\bar{r} = +0.2358\%$ ($+0.002358$).
-* **Average Position Hold Duration:** $\bar{\tau} = 15.81$ cycles ($474.4$s $\approx 7.91$ min) until fair-price exit fill.
-* **Little's Law Queue Load:** $L = \lambda \cdot \bar{\tau} = (p \cdot P_{\text{fill}}) \cdot \bar{\tau} = (0.10331 \times 0.520) \times 15.81 \approx 0.8493$ concurrent open trades.
+* **Production Observation Sample:** $`N_{\text{cycles}} = 484`$ consecutive 30-second cycles ($`4.03`$ hours).
+* **Empirical Anomaly Count:** $`N_{\text{anomalies}} = 50`$ market hunt undervaluation anomalies detected.
+* **Anomaly Probability per Cycle:** $`p = \frac{50}{484} = 0.10331`$ ($`10.33\%`$ per 30s cycle, recurring once every $`9.68`$ cycles $`\approx 290.4\text{ s} \approx 4.84\text{ min}`$).
+* **Maker Order Fill Rate (20s timeout):** $`P_{\text{fill}} = \frac{26}{50} = 52.0\%`$.
+* **Mean Realized Return per Trade:** $`\bar{r} = +0.2358\%`$ ($`+0.002358`$).
+* **Average Position Hold Duration:** $`\bar{\tau} = 15.81`$ cycles ($`474.4\text{ s} \approx 7.91\text{ min}`$) until fair-price exit fill.
+* **Little's Law Queue Load:** $`L = \lambda \cdot \bar{\tau} = (p \cdot P_{\text{fill}}) \cdot \bar{\tau} = (0.10331 \times 0.520) \times 15.81 \approx 0.8493`$ concurrent open trades.
 
-#### 3-Hour Expected Profit Equation ($\mathbb{E}[\Pi(S)]$)
+#### 3-Hour Expected Profit Equation ($`\mathbb{E}[\Pi(S)]`$)
 
-Over a 3-hour trading horizon ($T = 360$ cycles of 30 seconds), the engine encounters on average $360 \times 0.10331 \times 0.520 \approx 19.34$ completed trades. Given account equity $W_0 = 100,000\text{ USD}$ and concurrent trade distribution following a Poisson queue $P(K = k) = \frac{L^k e^{-L}}{k!}$, the expected dollar return as a function of `max_shares` proportion $S$ is:
+Over a 3-hour trading horizon ($`T = 360`$ cycles of 30 seconds), the engine encounters on average $`360 \times 0.10331 \times 0.520 \approx 19.34`$ completed trades. Given account equity $`W_0 = 100,000\text{ USD}`$ and concurrent trade distribution following a Poisson queue $`P(K = k) = \frac{L^k e^{-L}}{k!}`$, the expected dollar return as a function of `max_shares` proportion $`S`$ is:
 
-$$\mathbb{E}[\Pi(S)] = T \cdot p \cdot P_{\text{fill}} \cdot \bar{r} \cdot W_0 \sum_{k=0}^{\infty} \frac{L^k e^{-L}}{k!} \min\big(S, \; \max(0, 1 - k S)\big)$$
+$$
+\mathbb{E}[\Pi(S)] = T \cdot p \cdot P_{\text{fill}} \cdot \bar{r} \cdot W_0 \sum_{k=0}^{\infty} \frac{L^k e^{-L}}{k!} \min\big(S, \; \max(0, 1 - k S)\big)
+$$
 
 #### Profit Sensitivity & Concurrency Table
 
-| `max_shares` ($S$) | Strategy Profile | Concurrency Slots | Anomaly Capacity Covered | Expected 3-Hour Profit ($W_0 = 100\text{k}$ USD) |
+| `max_shares` ($`S`$) | Strategy Profile | Concurrency Slots | Anomaly Capacity Covered | Expected 3-Hour Profit ($`W_0 = 100\text{k}`$ USD) |
 |:---|:---|:---:|:---:|:---:|
 | **`0.05`** | Hyper-conservative | 20 slots | 100.0% | +228.00 USD |
 | **`0.10`** | Conservative | 10 slots | 100.0% | +456.00 USD |
@@ -150,7 +197,7 @@ $$\mathbb{E}[\Pi(S)] = T \cdot p \cdot P_{\text{fill}} \cdot \bar{r} \cdot W_0 \
 
 > [!TIP]
 > **Key Optimization Insight:**
-> Because the mean system queue load $L = 0.849$ is less than 1 concurrent trade, sitting on idle cash in order to guarantee room for overlapping anomalies produces a large opportunity cost. Committing 100% of available cash on every filled signal ($S^* = 1.0$) maximizes total expected dollar profit (**+1,951.35 USD** per 3 hours). For traders seeking higher trade-level diversification with 2 concurrent slots, $S = 0.50$ captures 84% of all overlapping opportunities while generating **+1,804.31 USD** (92.5% of maximum profit).
+> Because the mean system queue load $`L = 0.849`$ is less than 1 concurrent trade, sitting on idle cash in order to guarantee room for overlapping anomalies produces a large opportunity cost. Committing 100% of available cash on every filled signal ($`S^* = 1.0`$) maximizes total expected dollar profit (**+1,951.35 USD** per 3 hours). For traders seeking higher trade-level diversification with 2 concurrent slots, $`S = 0.50`$ captures 84% of all overlapping opportunities while generating **+1,804.31 USD** (92.5% of maximum profit).
 
 ### Algorithm Flow Diagram
 
@@ -197,21 +244,21 @@ flowchart TD
 Following a rigorous quantitative evaluation against 30-second intraday bars:
 
 1. **Ornstein-Uhlenbeck (OU):**
-   * While theoretically ideal for mean-reverting pairs, raw single-stock/crypto prices are non-stationary. Intraday momentum drifts continuously shift the equilibrium $\mu$, causing severe finite-sample downward bias on mean-reversion speed $\theta$ over short rolling windows.
+   * While theoretically ideal for mean-reverting pairs, raw single-stock/crypto prices are non-stationary. Intraday momentum drifts continuously shift the equilibrium $`\mu`$, causing severe finite-sample downward bias on mean-reversion speed $`\theta`$ over short rolling windows.
 2. **Exponential Moving Average (EMA / DEMA):**
-   * Standard EMA applies a static weight $\alpha$, treating bid-ask spread bounces as real trends.
+   * Standard EMA applies a static weight $`\alpha`$, treating bid-ask spread bounces as real trends.
    * DEMA eliminates linear-trend lag but applies negative weights to older observations, creating dangerous overshoot/ringing following sharp price drops and generating false buy signals into falling knives.
 3. **Adaptive 1D Kalman Filter (Selected):**
-   * **Spread-Aware:** Incorporates the instantaneous spread $(A_t - B_t)$ directly into observation variance $R_t$. When spreads widen during illiquid ticks, Kalman Gain drops, ignoring quote noise.
-   * **Low-Latency Trend Tracking:** Myers-Tapley innovation adaptation expands process variance $Q_t$ during genuine moves, eliminating lag cleanly.
-   * **Zero Space Leaks:** Consumes $O(1)$ memory with just 2 scalar state values $(\hat{x}, P)$.
+   * **Spread-Aware:** Incorporates the instantaneous spread $`(A_t - B_t)`$ directly into observation variance $`R_t`$. When spreads widen during illiquid ticks, Kalman Gain drops, ignoring quote noise.
+   * **Low-Latency Trend Tracking:** Myers-Tapley innovation adaptation expands process variance $`Q_t`$ during genuine moves, eliminating lag cleanly.
+   * **Zero Space Leaks:** Consumes $`O(1)`$ memory with just 2 scalar state values $`(\hat{x}, P)`$.
 
 ---
 
 ## 🚀 Key Engineering & Security Features
 
 1. **SEC Rule 612 Sub-Penny Compliance:**
-   * Enforces minimum price increments of $\$0.01$ (max 2 decimals) for equities $\ge \$1.00$. Sub-penny increments are strictly rounded to prevent Alpaca `HTTP 422 Unprocessable Entity` rejections.
+   * Enforces minimum price increments of $`\$0.01`$ (max 2 decimals) for equities $`\ge \$1.00`$. Sub-penny increments are strictly rounded to prevent Alpaca `HTTP 422 Unprocessable Entity` rejections.
 2. **Zero-Crash & Zero-Leak Runtime (Rust):**
    * Compiled with Link-Time Optimization (LTO), symbol stripping, and panic unwinding supervision. Eliminates garbage collection pauses and memory leaks.
 3. **24/7 Multi-Asset Support (Equities & Crypto):**
@@ -346,8 +393,8 @@ During a 7.7-hour continuous live test on Alpaca Paper Trading:
 * **Executed Trades:** 10 filled and completed hunts.
 * **Canceled Orders:** 10 orders canceled at 20 seconds with 0 leftover exposure.
 * **Win Rate:** 100.0%.
-* **Max Drawdown:** 0.0% ($0.00).
-* **Net Realized P&L:** +$1.47 USD (on 1-unit lot sizes).
+* **Max Drawdown:** 0.0% (<span>$</span>0.00).
+* **Net Realized P&L:** +<span>$</span>1.47 USD (on 1-unit lot sizes).
 
 ---
 
@@ -399,15 +446,15 @@ flowchart TD
 
 ### 1. Specification & Prompt Engineering (`prompt engineering/`)
 Before generating any implementation code, a rigorous quantitative and systems roadmap was defined in [`prompt engineering/SPECIFICATION.md`](prompt%20engineering/SPECIFICATION.md):
-* **Core Trading Protocol:** Discrete 30-second market sampling, "HiddenMM" maker queue placement (Best Bid + $0.01), 20-second fill timeouts, and 12-hour stale order liquidity recovery.
-* **Non-Linear Capital Sizing:** The asymptotic allocation formula $SharesAmount(x) = Max \times (1 - (1 - x^{level})^{1/level})$ mapping normalized deviation ratios into convex lot sizing.
+* **Core Trading Protocol:** Discrete 30-second market sampling, "HiddenMM" maker queue placement (Best Bid + <span>$</span>0.01), 20-second fill timeouts, and 12-hour stale order liquidity recovery.
+* **Non-Linear Capital Sizing:** The asymptotic allocation formula $`\text{SharesAmount}(x) = \text{Max} \times \left(1 - \left(1 - x^{\text{level}}\right)^{1/\text{level}}\right)`$ mapping normalized deviation ratios into convex lot sizing.
 * **Strict Risk Thresholds:** Dynamic circuit breaker ceilings (`max_margin`) halting order submission during flash crashes or abnormal market regime shifts.
 
 ### 2. Multi-Agent Autonomous Collaboration
 Two specialized AI agents were tasked to collaborate concurrently to build, verify, and harden the system:
 
 * **Agent 1 — Quantitative Researcher & Systems Architect:**
-  * **Mathematical Modeling:** Surveyed short-horizon stochastic models (Ornstein-Uhlenbeck continuous vs. discrete AR(1), Adaptive 1D Kalman Filters, and Dual EMAs). Formulated the dynamic discrete Kalman filter with spread-dependent measurement noise $R_t$ and Myers-Tapley innovation covariance $Q_t$.
+  * **Mathematical Modeling:** Surveyed short-horizon stochastic models (Ornstein-Uhlenbeck continuous vs. discrete AR(1), Adaptive 1D Kalman Filters, and Dual EMAs). Formulated the dynamic discrete Kalman filter with spread-dependent measurement noise $`R_t`$ and Myers-Tapley innovation covariance $`Q_t`$.
   * **Microstructure & SEC Rule 612:** Solved sub-penny tick compliance, establishing exact pricing rules to secure maker rebate priority without order rejections by Alpaca.
   * **Language & Resilience Analysis:** Evaluated language runtimes for zero-crash stability (Rust pure async vs. C++/OCaml IPC pipes), selecting a memory-safe unified model eliminating Linux pipe failures.
 
