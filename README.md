@@ -23,11 +23,11 @@ At first glance, an occasional 1% dip may not seem like a major issue. Once you 
 * After **100 tu**, **Stock A** reaches **~<span>$</span>138.87**, whereas **Stock B** reaches **~<span>$</span>270.48**:
 
 $$
-P_A(100) = \$100 \times \left(1.01^2 \times 0.99\right)^{100/3} \approx \$138.87
+\text{Price}_{A,\,100\text{tu}} = \$100 \times \left(1.01^2 \times 0.99\right)^{100/3} \approx \$138.87
 $$
 
 $$
-P_B(100) = \$100 \times 1.01^{100} \approx \$270.48
+\text{Price}_{B,\,100\text{tu}} = \$100 \times 1.01^{100} \approx \$270.48
 $$
 
 As you can see, **Stock B** ends up nearly **2× higher** in price than **Stock A**—meaning a recurring dip occurring just one-third of the time erodes roughly **half of the final portfolio value** (and over three-quarters of the net profit).
