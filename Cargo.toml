@@ -1,9 +1,9 @@
 [package]
 name = "anomalies-trading-engine"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 authors = ["Quantitative Trading Systems"]
-description = "Autonomous mean-reversion trading engine with adaptive Kalman filter and asymptotic allocation"
+description = "Autonomous mean-reversion trading engine with adaptive Kalman filter, exact Decimal financial invariants, and reconciled broker execution"
 
 [dependencies]
 tokio = { version = "1.43", features = ["full"] }
@@ -13,7 +13,13 @@ serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-uuid = { version = "=1.11.0", features = ["v4"] }
+uuid = { version = "1.11", features = ["v4"] }
+rust_decimal = { version = "1.36", features = ["serde"] }
+async-trait = "0.1"
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3.15"
 
 [profile.release]
 opt-level = 3

@@ -1,5 +1,8 @@
 pub mod client;
 pub mod types;
 
-pub use client::{AlpacaClient, AlpacaError};
-pub use types::{Clock, Order, OrderRequest, Position, QuoteDetail};
+pub use client::{AlpacaApi, AlpacaClient, AlpacaError};
+pub use types::{
+    Account, AccountActivity, LatestQuoteResponse, Order, OrderRequest, PortfolioHistory, Position,
+    QuoteDetail,
+};

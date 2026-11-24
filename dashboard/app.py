@@ -117,6 +117,7 @@ def render_dashboard_html(telemetry: dict, metrics: dict) -> str:
             "liquidated_stale": "badge-danger",
             "liquidated_manual": "badge-secondary",
             "liquidated_orphan": "badge-danger",
+            "adopted_closed": "badge-secondary",
         }.get(status_raw, "badge-info")
 
         pnl = t.get("pnl")

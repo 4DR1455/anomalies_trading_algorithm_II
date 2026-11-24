@@ -10,18 +10,25 @@ RUN apk add --no-cache musl-dev
 COPY Cargo.toml ./
 
 # Create dummy source to cache compiled dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs && \
+RUN mkdir src && \
+    echo "pub fn dummy() {}" > src/lib.rs && \
+    echo "fn main() {}" > src/main.rs && \
     cargo build --release && \
-    rm -rf src
+    rm -rf src target/release/.fingerprint/anomalies-trading-engine* target/release/deps/anomalies_trading_engine* target/release/deps/libanomalies_trading_engine* target/release/anomalies-trading-engine*
 
 # Copy real source code
 COPY src ./src
 
-# Build production binary with LTO and strip
-RUN cargo build --release
+# Build production binary with LTO, strip, and zero-warning enforcement
+RUN RUSTFLAGS="-D warnings" cargo build --release
 
-# Stage 2: Hardened runtime environment
-FROM alpine:3.21
+# Optional test stage (`docker build --target rust-test .`)
+FROM builder AS rust-test
+COPY tests ./tests
+RUN RUSTFLAGS="-D warnings" cargo test
+
+# Stage 2: Hardened runtime environment (`docker build --target rust-build .` or default)
+FROM alpine:3.21 AS rust-build
 
 # Install CA certificates for outbound HTTPS calls to Alpaca API
 RUN apk add --no-cache ca-certificates tzdata

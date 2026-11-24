@@ -1,74 +1,352 @@
 pub mod hunt;
-pub mod order_hygiene;
+pub mod reconciliation;
 
-use crate::alpaca::AlpacaClient;
-use crate::config::AppConfig;
-use crate::model::{calculate_shares_amount, AdaptiveKalmanFilter, SignalType};
-use crate::state::{EngineState, StateManager};
-use crate::telemetry::{TelemetrySnapshot, TelemetryWriter};
-use chrono::Utc;
-use hunt::HuntExecutor;
-use order_hygiene::OrderHygieneManager;
+use crate::alpaca::{AlpacaApi, AlpacaClient, PortfolioHistory};
+use crate::config::{AppConfig, StrategyParams};
+use crate::engine::hunt::{execute_hunt, HuntTiming};
+use crate::engine::reconciliation::{
+    build_broker_telemetry, calibrate_fee_tracker_from_sell, reconcile_and_maintain_positions,
+    ReconciliationTiming,
+};
+use crate::metrics::{
+    compute_performance_metrics, compute_portfolio_history_metrics, PerformanceMetrics,
+};
+use crate::model::{
+    decimal_from_f64_clean, decimal_to_f64, AdaptiveKalmanFilter, FeeTracker, SignalType,
+};
+use crate::state::{trim_hunts_preserving_active, StateStore, TradeRecord};
+use crate::telemetry::TelemetrySnapshot;
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::broadcast;
 use tokio::time::{sleep, Instant};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-pub struct TradingEngine {
-    config: AppConfig,
-    client: AlpacaClient,
-    filter: AdaptiveKalmanFilter,
-    state_mgr: StateManager,
-    telemetry: TelemetryWriter,
-    state: EngineState,
+pub const MAX_TERMINAL_HUNTS: usize = 50;
+pub const PORTFOLIO_HISTORY_REFRESH_SECS: u64 = 600;
+pub const DEFAULT_RISK_FREE_RATE: f64 = 0.04;
+pub const DEFAULT_BASE_EQUITY: f64 = 100_000.0;
+
+/// Combined timing parameters for reconciliation and market hunt execution.
+#[derive(Debug, Clone, Copy)]
+pub struct EngineTiming {
+    pub reconciliation: ReconciliationTiming,
+    pub hunt: HuntTiming,
 }
 
-impl TradingEngine {
+impl EngineTiming {
+    pub fn from_params(params: &StrategyParams) -> Self {
+        Self {
+            reconciliation: ReconciliationTiming::default(),
+            hunt: HuntTiming::from_params(params),
+        }
+    }
+
+    pub fn fast_for_tests() -> Self {
+        Self {
+            reconciliation: ReconciliationTiming::fast_for_tests(),
+            hunt: HuntTiming::fast_for_tests(),
+        }
+    }
+}
+
+/// Autonomous mean-reversion trading engine parameterized over `AlpacaApi` for deterministic testing.
+pub struct TradingEngine<C: AlpacaApi> {
+    params: StrategyParams,
+    client: C,
+    filter: AdaptiveKalmanFilter,
+    store: StateStore,
+    fee_tracker: FeeTracker,
+    trades_history: Vec<TradeRecord>,
+    portfolio_history: Option<PortfolioHistory>,
+    last_ph_fetch: Option<Instant>,
+    circuit_breaker_active: bool,
+    timing: EngineTiming,
+}
+
+impl TradingEngine<AlpacaClient> {
+    /// Production constructor building an authenticated `AlpacaClient` from `AppConfig`.
     pub fn new(config: AppConfig) -> Result<Self, String> {
         let client = AlpacaClient::new(&config.credentials)
             .map_err(|e| format!("Alpaca client initialization failed: {}", e))?;
-
-        let state_mgr = StateManager::new(&config.data_dir);
-        let telemetry = TelemetryWriter::new(&config.data_dir);
-        let state = state_mgr.load();
-
-        let filter = AdaptiveKalmanFilter::new(
-            config.params.kalman.clone(),
-            config.params.min_margin,
-            config.params.max_margin,
-            state.kalman.clone(),
-        );
-
-        Ok(Self {
-            config,
+        let timing = EngineTiming::from_params(&config.params);
+        Ok(Self::with_client_and_timing(
+            config.params,
+            &config.data_dir,
             client,
-            filter,
-            state_mgr,
-            telemetry,
-            state,
-        })
+            timing,
+        ))
+    }
+}
+
+impl<C: AlpacaApi> TradingEngine<C> {
+    /// Generic constructor accepting any `AlpacaApi` implementation (live or mock).
+    pub fn with_client<P: AsRef<Path>>(params: StrategyParams, data_dir: P, client: C) -> Self {
+        let timing = EngineTiming::from_params(&params);
+        Self::with_client_and_timing(params, data_dir, client, timing)
     }
 
-    /// Run the main continuous trading cycle (every 30 seconds)
-    pub async fn start(&mut self, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
-        let cycle_duration = Duration::from_secs(self.config.params.cycle_seconds);
+    /// Generic constructor with explicit polling/settlement timing (ideal for fast integration tests).
+    pub fn with_client_and_timing<P: AsRef<Path>>(
+        params: StrategyParams,
+        data_dir: P,
+        client: C,
+        timing: EngineTiming,
+    ) -> Self {
+        let store = StateStore::new(data_dir);
+        let trades_history = store.load_hunts(MAX_TERMINAL_HUNTS);
+        let initial_kalman = store.load_kalman_state();
+
+        let filter = AdaptiveKalmanFilter::new(
+            params.kalman.clone(),
+            params.min_margin,
+            params.max_margin,
+            initial_kalman,
+        );
+
+        Self {
+            params,
+            client,
+            filter,
+            store,
+            fee_tracker: FeeTracker::new(),
+            trades_history,
+            portfolio_history: None,
+            last_ph_fetch: None,
+            circuit_breaker_active: false,
+            timing,
+        }
+    }
+
+    pub fn params(&self) -> &StrategyParams {
+        &self.params
+    }
+
+    pub fn client(&self) -> &C {
+        &self.client
+    }
+
+    pub fn filter(&self) -> &AdaptiveKalmanFilter {
+        &self.filter
+    }
+
+    pub fn filter_mut(&mut self) -> &mut AdaptiveKalmanFilter {
+        &mut self.filter
+    }
+
+    pub fn store(&self) -> &StateStore {
+        &self.store
+    }
+
+    pub fn fee_tracker(&self) -> &FeeTracker {
+        &self.fee_tracker
+    }
+
+    pub fn fee_tracker_mut(&mut self) -> &mut FeeTracker {
+        &mut self.fee_tracker
+    }
+
+    pub fn trades_history(&self) -> &[TradeRecord] {
+        &self.trades_history
+    }
+
+    pub fn trades_history_mut(&mut self) -> &mut Vec<TradeRecord> {
+        &mut self.trades_history
+    }
+
+    /// Performs startup initialization:
+    /// 1. Calibrates `FeeTracker` from recent Alpaca `CFEE` activities (crypto only).
+    /// 2. Loads official Alpaca `portfolio/history` (1A / 1D) for equity/drawdown charts.
+    /// 3. Persists initial `metrics.json`.
+    pub async fn initialize(&mut self) {
+        if self.params.is_crypto() {
+            self.calibrate_fee_tier_from_startup_cfee().await;
+        }
+
+        match self.client.get_portfolio_history("1A", "1D").await {
+            Ok(ph) => {
+                let count = ph.equity.len();
+                self.portfolio_history = Some(ph);
+                self.last_ph_fetch = Some(Instant::now());
+                info!(
+                    "[PORTFOLIO HISTORY] Loaded {} official Alpaca daily equity points.",
+                    count
+                );
+            }
+            Err(e) => {
+                warn!("Could not load initial Alpaca portfolio history: {}", e);
+            }
+        }
+
+        let now = Utc::now();
+        let metrics = self.compute_current_metrics(None, now);
+        if let Err(e) = self.store.save_metrics(&metrics) {
+            warn!("Failed to persist initial metrics.json: {}", e);
+        }
+
+        let tier = self.fee_tracker.current_tier();
         info!(
-            "Trading Engine started for symbol {} with cycle interval {}s",
-            self.config.params.symbol, self.config.params.cycle_seconds
+            "[STARTUP] Loaded {} hunts | Kalman initialized={} (samples={}) | Crypto Fee Tier {} (maker={}, taker={}, exit_floor={}) | Portfolio PnL: ${:+.2}",
+            self.trades_history.len(),
+            self.filter.is_initialized(),
+            self.filter.state().sample_count,
+            tier.tier,
+            tier.maker_rate,
+            tier.taker_rate,
+            self.fee_tracker.worst_sell_fee_rate(),
+            metrics.total_pnl
+        );
+    }
+
+    /// Inspects recent `CFEE` activities at startup to calibrate the active Alpaca crypto volume tier.
+    /// Always preserves `worst_sell_fee_rate() >= 0.0025` inside `FeeTracker`.
+    async fn calibrate_fee_tier_from_startup_cfee(&mut self) {
+        let activities = match self.client.get_account_activities("CFEE", None).await {
+            Ok(acts) => acts,
+            Err(e) => {
+                debug!("Startup CFEE fetch skipped: {}", e);
+                return;
+            }
+        };
+
+        // Group CFEE amounts by order_id while preserving most-recent-first encounter order
+        let mut order_ids_ordered: Vec<String> = Vec::new();
+        let mut fee_by_order: HashMap<String, Decimal> = HashMap::new();
+        let mut direct_candidates: Vec<(Decimal, Decimal)> = Vec::new();
+
+        for act in activities {
+            if !act.activity_type.is_empty() && !act.activity_type.eq_ignore_ascii_case("CFEE") {
+                continue;
+            }
+            let Some(fee_abs) = act.fee_usd_abs() else {
+                continue;
+            };
+            if let Some(oid) = act.order_id.filter(|s| !s.is_empty()) {
+                let entry = fee_by_order.entry(oid.clone()).or_insert_with(|| {
+                    order_ids_ordered.push(oid);
+                    Decimal::ZERO
+                });
+                *entry += fee_abs;
+            } else if let (Some(qty), Some(price)) = (act.qty, act.price) {
+                if qty > Decimal::ZERO && price > Decimal::ZERO {
+                    direct_candidates.push((fee_abs, qty * price));
+                }
+            }
+        }
+
+        let tier_before = self.fee_tracker.current_tier();
+
+        // Check up to the 5 most recent CFEE orders for a clean calibration sample (>= $100 notional)
+        for oid in order_ids_ordered.into_iter().take(5) {
+            let Some(&fee_usd) = fee_by_order.get(&oid) else {
+                continue;
+            };
+
+            let notional_and_type = match self.client.get_order(&oid).await {
+                Ok(ord) => {
+                    let px = ord.filled_avg_price.unwrap_or(Decimal::ZERO);
+                    if ord.filled_qty > Decimal::ZERO && px > Decimal::ZERO {
+                        Some((ord.filled_qty * px, ord.order_type == "market"))
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => self
+                    .trades_history
+                    .iter()
+                    .find(|t| t.sell_order_id.as_deref() == Some(oid.as_str()))
+                    .and_then(|t| {
+                        let px = t.sell_price?;
+                        if t.qty > Decimal::ZERO && px > Decimal::ZERO {
+                            Some((
+                                t.qty * px,
+                                t.status == crate::state::HuntStatus::LiquidatedStale,
+                            ))
+                        } else {
+                            None
+                        }
+                    }),
+            };
+
+            if let Some((notional, is_market)) = notional_and_type {
+                calibrate_fee_tracker_from_sell(&mut self.fee_tracker, fee_usd, notional, is_market);
+                if self.fee_tracker.current_tier() != tier_before {
+                    return;
+                }
+            }
+        }
+
+        for (fee_usd, notional) in direct_candidates.into_iter().take(5) {
+            calibrate_fee_tracker_from_sell(&mut self.fee_tracker, fee_usd, notional, false);
+            if self.fee_tracker.current_tier() != tier_before {
+                return;
+            }
+        }
+    }
+
+    fn compute_current_metrics(
+        &self,
+        live_equity: Option<f64>,
+        now_dt: DateTime<Utc>,
+    ) -> PerformanceMetrics {
+        if let Some(ref ph) = self.portfolio_history {
+            if !ph.equity.is_empty() {
+                return compute_portfolio_history_metrics(
+                    ph,
+                    live_equity,
+                    &self.trades_history,
+                    DEFAULT_RISK_FREE_RATE,
+                    now_dt,
+                );
+            }
+        }
+        compute_performance_metrics(
+            &self.trades_history,
+            DEFAULT_RISK_FREE_RATE,
+            DEFAULT_BASE_EQUITY,
+            now_dt,
+        )
+    }
+
+    /// Runs the continuous 30-second autonomous trading loop until graceful shutdown is signaled.
+    pub async fn start(
+        &mut self,
+        mut shutdown_rx: broadcast::Receiver<()>,
+        shutdown_flag: Arc<AtomicBool>,
+    ) {
+        self.initialize().await;
+
+        let cycle_duration = Duration::from_secs(self.params.cycle_seconds);
+        info!(
+            "Trading Engine active for {} (cycle={}s, level={}, max_shares={}, min_margin={:.4}%, max_margin={:.4}%, stale_limit={}s)",
+            self.params.symbol,
+            self.params.cycle_seconds,
+            self.params.level,
+            self.params.max_shares,
+            self.params.min_margin * 100.0,
+            self.params.max_margin * 100.0,
+            self.params.stale_order_max_age_seconds
         );
 
         loop {
-            let cycle_start = Instant::now();
+            if shutdown_flag.load(Ordering::Relaxed) || shutdown_rx.try_recv().is_ok() {
+                self.persist_shutdown_state();
+                break;
+            }
 
-            tokio::select! {
-                _ = shutdown_rx.recv() => {
-                    info!("Graceful shutdown signal received. Saving state and terminating trading engine.");
-                    self.state.kalman = Some(self.filter.state().clone());
-                    let _ = self.state_mgr.save(&self.state);
-                    break;
-                }
-                _ = self.step_cycle() => {
-                    // Step cycle completed
-                }
+            let cycle_start = Instant::now();
+            if let Err(e) = self.step_cycle_at(Utc::now(), Some(&shutdown_flag)).await {
+                warn!("Cycle error for {}: {}", self.params.symbol, e);
+            }
+
+            if shutdown_flag.load(Ordering::Relaxed) {
+                self.persist_shutdown_state();
+                break;
             }
 
             let elapsed = cycle_start.elapsed();
@@ -76,9 +354,8 @@ impl TradingEngine {
                 let remaining = cycle_duration - elapsed;
                 tokio::select! {
                     _ = shutdown_rx.recv() => {
-                        info!("Graceful shutdown signal received during wait interval.");
-                        self.state.kalman = Some(self.filter.state().clone());
-                        let _ = self.state_mgr.save(&self.state);
+                        info!("Graceful shutdown signal received during cycle sleep.");
+                        self.persist_shutdown_state();
                         break;
                     }
                     _ = sleep(remaining) => {}
@@ -87,137 +364,236 @@ impl TradingEngine {
         }
     }
 
-    async fn step_cycle(&mut self) {
-        let symbol = &self.config.params.symbol;
-        info!("--- Starting 30s cycle for {} ---", symbol);
+    fn persist_shutdown_state(&self) {
+        info!("Persisting Kalman state and hunt history before shutdown...");
+        if let Err(e) = self.store.save_kalman_state(self.filter.state()) {
+            error!("Failed to save kalman_state.json on shutdown: {}", e);
+        }
+        if let Err(e) = self
+            .store
+            .save_hunts(&self.trades_history, MAX_TERMINAL_HUNTS)
+        {
+            error!("Failed to save hunts_history.json on shutdown: {}", e);
+        }
+    }
 
-        // 1. Fetch latest quote
-        let quote = match self.client.get_latest_quote(symbol).await {
-            Ok(q) => q,
-            Err(e) => {
-                warn!("Failed to fetch quote for {}: {}", symbol, e);
-                return;
+    /// Executes a single trading & reconciliation cycle using the current wall-clock UTC time.
+    pub async fn step_cycle(&mut self) -> Result<TelemetrySnapshot, String> {
+        self.step_cycle_at(Utc::now(), None).await
+    }
+
+    /// Executes a single deterministic trading & reconciliation cycle at timestamp `now_dt`.
+    pub async fn step_cycle_at(
+        &mut self,
+        now_dt: DateTime<Utc>,
+        shutdown_flag: Option<&AtomicBool>,
+    ) -> Result<TelemetrySnapshot, String> {
+        let symbol = self.params.symbol.clone();
+
+        // 1. Periodically refresh official Alpaca portfolio history (every 10 minutes)
+        let should_refresh_ph = self
+            .last_ph_fetch
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(PORTFOLIO_HISTORY_REFRESH_SECS));
+        if should_refresh_ph {
+            match self.client.get_portfolio_history("1A", "1D").await {
+                Ok(ph) => {
+                    self.portfolio_history = Some(ph);
+                    self.last_ph_fetch = Some(Instant::now());
+                }
+                Err(e) => {
+                    warn!("Refreshing Alpaca portfolio history failed: {}", e);
+                }
             }
+        }
+
+        // 2. Fetch live quote & update Adaptive 1D Kalman Filter
+        let quote = self
+            .client
+            .get_latest_quote(&symbol)
+            .await
+            .map_err(|e| format!("Failed to fetch quote for {}: {}", symbol, e))?;
+
+        let bid_d = quote.bid_price;
+        let ask_d = quote.ask_price;
+        let bid_f = decimal_to_f64(bid_d);
+        let ask_f = decimal_to_f64(ask_d);
+
+        let ku = self.filter.update(bid_f, ask_f);
+        let fair_price_f = ku.fair_price;
+        let fair_price_d = decimal_from_f64_clean(fair_price_f).unwrap_or(Decimal::ZERO);
+        let mid_f = if ku.market_mid > 0.0 {
+            ku.market_mid
+        } else {
+            0.5 * (bid_f + ask_f)
         };
 
-        let bid = quote.bid_price;
-        let ask = quote.ask_price;
-        let mid = 0.5 * (bid + ask);
+        if let Err(e) = self.store.save_kalman_state(self.filter.state()) {
+            warn!("Failed to persist kalman_state.json: {}", e);
+        }
 
-        // 2. Update Kalman filter
-        let signal = self.filter.update(bid, ask);
-        let fair_price = self.filter.state().x_hat;
+        // 3. Full Broker Reconciliation, Exit Monitoring, 12h Stale Liquidation, Adoption & Orphan Protection
+        let (pending_updated, mut broker_telemetry) = reconcile_and_maintain_positions(
+            &self.client,
+            &self.params,
+            &mut self.trades_history,
+            &mut self.fee_tracker,
+            fair_price_d,
+            bid_d,
+            now_dt,
+            Some(&self.store),
+            self.timing.reconciliation,
+        )
+        .await;
 
-        match &signal {
+        if pending_updated {
+            self.trades_history =
+                trim_hunts_preserving_active(&self.trades_history, MAX_TERMINAL_HUNTS);
+            if let Err(e) = self
+                .store
+                .save_hunts(&self.trades_history, MAX_TERMINAL_HUNTS)
+            {
+                error!("Failed to persist hunts_history.json after reconciliation: {}", e);
+            }
+        }
+
+        info!(
+            "[{}] Bid=${:.2} Ask=${:.2} | Kalman=${:.2} | Margin={:+.4}% | Pos={:.4} ({})",
+            now_dt.format("%Y-%m-%d %H:%M:%S"),
+            bid_f,
+            ask_f,
+            fair_price_f,
+            ku.undervaluation_margin * 100.0,
+            broker_telemetry.reconciliation.broker_qty,
+            if broker_telemetry.reconciliation.is_synced {
+                "SYNCED".to_string()
+            } else {
+                format!("DRIFT={:+.4}", broker_telemetry.reconciliation.untracked_qty)
+            }
+        );
+
+        // 4. Process Kalman Signal
+        match &ku.signal {
             SignalType::CircuitBreakerHalt {
                 undervaluation_margin,
                 max_margin,
                 reason,
+                ..
             } => {
+                self.circuit_breaker_active = true;
                 warn!(
-                    "CIRCUIT BREAKER TRIGGERED: margin {:.4}% exceeds max_margin {:.4}%. Halting entries! ({})",
+                    "[CIRCUIT BREAKER] Deviation {:.4}% > {:.4}%. Halting entries ({})",
                     undervaluation_margin * 100.0,
                     max_margin * 100.0,
                     reason
                 );
-                self.state.circuit_breaker_active = true;
             }
             SignalType::BuyAnomaly {
                 undervaluation_margin,
                 fair_price,
                 market_mid,
             } => {
-                self.state.circuit_breaker_active = false;
-                let shares = calculate_shares_amount(
-                    *undervaluation_margin,
-                    self.config.params.min_margin,
-                    self.config.params.max_margin,
-                    self.config.params.level,
-                    self.config.params.max_shares,
-                );
-
+                self.circuit_breaker_active = false;
                 info!(
-                    "Undervaluation anomaly detected! Margin: {:.4}%, Fair: ${:.2}, Mid: ${:.2} -> Sizing: {} shares",
-                    undervaluation_margin * 100.0, fair_price, market_mid, shares
+                    "[ANOMALY DETECTED] Margin {:.4}% >= {:.4}% | Fair=${:.2} Mid=${:.2}",
+                    undervaluation_margin * 100.0,
+                    self.params.min_margin * 100.0,
+                    fair_price,
+                    market_mid
                 );
 
-                if shares > 0.0 {
-                    let executor = HuntExecutor::new(
-                        &self.client,
-                        symbol,
-                        self.config.params.hidden_mm_timeout_seconds,
-                    );
-                    match executor.execute_hunt(bid, ask, *fair_price, shares).await {
-                        Ok(Some(trade)) => {
-                            self.state.active_hunts.push(trade);
+                match execute_hunt(
+                    &self.client,
+                    &self.params,
+                    *fair_price,
+                    &mut self.trades_history,
+                    &mut self.fee_tracker,
+                    Some(&self.store),
+                    now_dt,
+                    self.timing.hunt,
+                    shutdown_flag,
+                )
+                .await
+                {
+                    Ok(Some(_created)) => {
+                        self.trades_history =
+                            trim_hunts_preserving_active(&self.trades_history, MAX_TERMINAL_HUNTS);
+                        if let Err(e) = self
+                            .store
+                            .save_hunts(&self.trades_history, MAX_TERMINAL_HUNTS)
+                        {
+                            error!("Failed to persist hunts_history.json after hunt: {}", e);
                         }
-                        Ok(None) => {}
-                        Err(e) => {
-                            error!("Error during Market Hunt execution: {}", e);
+
+                        // Refresh broker telemetry so snapshot reflects newly placed exit immediately
+                        let acc_post = self.client.get_account().await.ok();
+                        let pos_post = self.client.get_position(&symbol).await.ok().flatten();
+                        let open_post = self
+                            .client
+                            .get_open_orders(Some(&symbol))
+                            .await
+                            .unwrap_or_default();
+                        if acc_post.is_some() || pos_post.is_some() {
+                            broker_telemetry = build_broker_telemetry(
+                                acc_post.as_ref(),
+                                pos_post.as_ref(),
+                                &open_post,
+                                &self.trades_history,
+                            );
                         }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        error!("Error during Market Hunt execution: {}", e);
                     }
                 }
             }
             SignalType::None => {
-                self.state.circuit_breaker_active = false;
-                info!(
-                    "Quote: Bid ${:.2} / Ask ${:.2} (Mid ${:.2}) | Kalman Fair Price: ${:.2} | No Anomaly",
-                    bid, ask, mid, fair_price
-                );
+                self.circuit_breaker_active = false;
             }
         }
 
-        // 3. Run Order Hygiene & Stale Order Cleanup
-        let hygiene = OrderHygieneManager::new(
-            &self.client,
-            symbol,
-            self.config.params.stale_order_max_age_seconds,
-        );
-        hygiene
-            .run_hygiene_cycle(
-                &mut self.state.active_hunts,
-                &mut self.state.completed_trades,
-                &mut self.state.total_realized_pnl,
-                fair_price,
-            )
-            .await;
-
-        // 4. Update Engine State & Save Atomically
-        self.state.kalman = Some(self.filter.state().clone());
-        self.state.last_cycle_timestamp = Some(Utc::now().to_rfc3339());
-        if let Err(e) = self.state_mgr.save(&self.state) {
-            error!("Failed to persist state: {}", e);
+        // 5. Compute & atomically persist metrics.json
+        let live_eq_now = broker_telemetry.broker_account.equity;
+        let metrics = self.compute_current_metrics(live_eq_now, now_dt);
+        if let Err(e) = self.store.save_metrics(&metrics) {
+            warn!("Failed to persist metrics.json: {}", e);
         }
 
-        // 5. Emit Telemetry Snapshot for Python Dashboard
-        let current_margin = if fair_price > 0.0 {
-            (fair_price - mid) / fair_price
-        } else {
-            0.0
-        };
-
-        let mut all_trades = self.state.completed_trades.clone();
-        all_trades.extend(self.state.active_hunts.clone());
+        // 6. Build & atomically persist telemetry.json
+        let active_hunts_count = self
+            .trades_history
+            .iter()
+            .filter(|h| h.status.is_active())
+            .count();
+        let completed_trades_count = self
+            .trades_history
+            .iter()
+            .filter(|h| h.status.is_closed_strategy_trade())
+            .count();
 
         let snapshot = TelemetrySnapshot {
-            timestamp: Utc::now().to_rfc3339(),
-            symbol: symbol.clone(),
-            best_bid: bid,
-            best_ask: ask,
-            market_mid: mid,
-            fair_price,
-            undervaluation_margin: current_margin,
-            min_margin: self.config.params.min_margin,
-            max_margin: self.config.params.max_margin,
-            circuit_breaker_active: self.state.circuit_breaker_active,
-            active_hunts_count: self.state.active_hunts.len(),
-            completed_trades_count: self.state.completed_trades.len(),
-            total_realized_pnl: self.state.total_realized_pnl,
-            trades: all_trades,
+            timestamp: now_dt.to_rfc3339(),
+            symbol,
+            best_bid: bid_f,
+            best_ask: ask_f,
+            market_mid: mid_f,
+            fair_price: fair_price_f,
+            undervaluation_margin: ku.undervaluation_margin,
+            min_margin: self.params.min_margin,
+            max_margin: self.params.max_margin,
+            circuit_breaker_active: self.circuit_breaker_active,
+            active_hunts_count,
+            completed_trades_count,
+            total_realized_pnl: metrics.total_pnl,
+            broker: broker_telemetry,
+            trades: self.trades_history.clone(),
+            metrics,
         };
 
-        if let Err(e) = self.telemetry.write_snapshot(&snapshot) {
-            warn!("Failed to write telemetry: {}", e);
+        if let Err(e) = self.store.save_telemetry(&snapshot) {
+            warn!("Failed to persist telemetry.json: {}", e);
         }
+
+        Ok(snapshot)
     }
 }
