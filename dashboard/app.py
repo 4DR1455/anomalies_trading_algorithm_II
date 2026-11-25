@@ -253,7 +253,7 @@ def render_dashboard_html(telemetry: dict, metrics: dict) -> str:
         win_rate_sub = f"Profit Factor: {metrics.get('profit_factor', 0.0)}"
     else:
         win_rate_val = "N/A"
-        win_rate_sub = "Orders migrating"
+        win_rate_sub = "Awaiting closed trades"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -286,6 +286,10 @@ def render_dashboard_html(telemetry: dict, metrics: dict) -> str:
                 <div class="small text-secondary mt-1">Snapshot: {snap_esc} UTC</div>
             </div>
         </div>
+    </div>
+
+    <div class="alert alert-warning d-flex align-items-center justify-content-center py-2 mb-4 fw-semibold" role="alert">
+        &#9888;&nbsp; Still testing new bot
     </div>
 
     {circuit_breaker_html}
@@ -424,7 +428,6 @@ def render_dashboard_html(telemetry: dict, metrics: dict) -> str:
             <div class="card p-3">
                 <div class="d-flex flex-wrap justify-content-between align-items-center mb-3 gap-2">
                     <h6 class="text-secondary mb-0">Live Hunts &amp; Recent Execution History</h6>
-                    <span class="badge bg-warning text-dark px-2 py-1" style="font-weight: 500;">&#9888; Dashboard migrated, we are still working on the orders</span>
                 </div>
                 <div class="table-responsive">
                     <table class="table table-dark table-hover table-striped align-middle mb-0">
