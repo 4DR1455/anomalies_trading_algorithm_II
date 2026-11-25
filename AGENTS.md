@@ -13,3 +13,14 @@
    - **Rule of Thumb:** If it executes trades, computes live signals/orders/sizing, reconciles positions, or talks to Alpaca for trading operations → **RUST ONLY**. If it is purely offline research/analytics that does not touch live bot execution → **best tool for the job**.
 5. **Amendment Rule:**
    - Adding any language other than **RUST** to the approved list for bot/engine/API code requires explicit written approval from the user.
+
+---
+
+## Mandatory Branch-First Workflow Policy (Strictly Enforced)
+
+1. **Same Scope as the Rust Policy:** Applies to **every** agent (main agent and all subagents) modifying any file that affects the trading bot's operational behavior (`src/`, `Cargo.toml`, `params.json`, `Dockerfile`, or any runtime/API/model/execution logic).
+2. **Never Edit `main` Directly for Operational Changes:** Before making any operational code or parameter edits, the agent **must** create and work on a dedicated Git branch (e.g., `feat/<topic>`, `fix/<topic>`, `refactor/<topic>`, or an isolated branched workspace).
+3. **Mandatory Testing & Validation on the Branch:** All changes must be compiled, linted (`cargo clippy --all-targets -- -D warnings`), tested (`RUSTFLAGS='-D warnings' cargo test`, including unit, integration, and formal verification suites), and verified working **on the branch** before integration.
+4. **Merge Only After Validation Passes:** Merge the branch back into `main` (and deploy to production, if requested) **only after** all tests, lints, and mathematical/behavioral validations pass cleanly.
+5. **Clean Up:** Remove temporary local feature branches after merging cleanly into `main`.
+
