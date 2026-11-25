@@ -11,22 +11,27 @@ use anomalies_trading_engine::alpaca::{
     Account, AccountActivity, AlpacaApi, AlpacaError, Order, OrderRequest, PortfolioHistory,
     Position, QuoteDetail,
 };
-use anomalies_trading_engine::config::{KalmanParams, StrategyParams};
-use anomalies_trading_engine::engine::hunt::{execute_hunt, HuntTiming};
+use anomalies_trading_engine::config::{AppConfig, KalmanParams, RegimeSizingParams, StrategyParams};
+use anomalies_trading_engine::engine::hunt::{
+    execute_hunt, execute_hunt_with_notional_cap, HuntTiming,
+};
 use anomalies_trading_engine::engine::reconciliation::{
     classify_filled_exit_status, fetch_actual_cfee_usd, reconcile_and_maintain_positions,
     submit_exit_sell_with_retry, try_resolve_profitable_exit_price, ReconciliationTiming,
 };
+use anomalies_trading_engine::engine::{EngineTiming, TradingEngine};
 use anomalies_trading_engine::metrics::{
     compute_performance_metrics, compute_portfolio_history_metrics,
 };
 use anomalies_trading_engine::model::{
-    calculate_dynamic_portfolio_shares, calculate_hidden_mm_buy_price, ceil_to_tick,
-    ceil_usd_cents, compute_guaranteed_profitable_exit_price, compute_net_trade_pnl,
-    decimal_from_f64_clean, decimal_to_f64, floor_qty, floor_to_tick, format_tick_price,
-    get_tick_size, is_dust_qty, round_to_tick, AdaptiveKalmanFilter, FeeTracker, PricingError,
-    SignalType, ALPACA_CRYPTO_FEE_TIERS, CFEE_CEIL_BUFFER_USD, CRYPTO_TIER1_MAKER_FEE_RATE,
-    CRYPTO_TIER1_TAKER_FEE_RATE, HALF_CENT_USD, MIN_NET_PROFIT_MARGIN, MIN_ORDER_NOTIONAL_USD,
+    calculate_dynamic_portfolio_shares, calculate_hidden_mm_buy_price,
+    calculate_notional_capped_shares, ceil_to_tick, ceil_usd_cents,
+    compute_guaranteed_profitable_exit_price, compute_net_trade_pnl, decimal_from_f64_clean,
+    decimal_to_f64, floor_qty, floor_to_tick, format_tick_price, get_tick_size, is_dust_qty,
+    round_to_tick, AdaptiveKalmanFilter, FeeTracker, PricingError, RegimeNotionalController,
+    RegimeNotionalState, SignalType, ALPACA_CRYPTO_FEE_TIERS, CFEE_CEIL_BUFFER_USD,
+    CRYPTO_TIER1_MAKER_FEE_RATE, CRYPTO_TIER1_TAKER_FEE_RATE, HALF_CENT_USD, MIN_NET_PROFIT_MARGIN,
+    MIN_ORDER_NOTIONAL_USD,
 };
 use anomalies_trading_engine::state::{HuntStatus, StateStore, TradeRecord};
 use anomalies_trading_engine::telemetry::build_broker_telemetry;
@@ -115,6 +120,7 @@ fn default_sol_params() -> StrategyParams {
             spread_weight: 2.0,
             adapt_lambda: 0.20,
         },
+        regime_sizing: Default::default(),
     }
 }
 
@@ -3706,4 +3712,1498 @@ async fn theorem6_adversarial_5page_cfee_pagination_dedup_and_termination() {
         "[THEOREM 6 CFEE 5-PAGE PAGINATION PROVEN] 250-fill overlap dedup=$5.40, 5-page hard cap=500, cursor-cycle guard=2 calls, mid-page error=None"
     );
 }
+
+// =============================================================================
+// THEOREM 7 — Fixed-USD Dynamic Regime Sizing & Concurrent Exposure Safety
+// =============================================================================
+
+struct T7BrokerState {
+    account: Account,
+    position: Option<Position>,
+    orders: HashMap<String, Order>,
+    quote_queue: VecDeque<QuoteDetail>,
+    default_quote: QuoteDetail,
+    activities: Vec<AccountActivity>,
+    buy_fee_rate: Decimal,
+    fail_next_sell: bool,
+    market_fill_price: Decimal,
+    next_seq: u64,
+}
+
+impl T7BrokerState {
+    fn new(cash: Decimal, default_bid: Decimal, default_ask: Decimal) -> Self {
+        Self {
+            account: Account {
+                equity: cash,
+                cash,
+                buying_power: cash,
+                non_marginable_buying_power: Some(cash),
+            },
+            position: None,
+            orders: HashMap::new(),
+            quote_queue: VecDeque::new(),
+            default_quote: QuoteDetail {
+                timestamp: Some("2026-11-25T10:00:00Z".into()),
+                bid_price: default_bid,
+                ask_price: default_ask,
+                bid_size: Some(d("10000")),
+                ask_size: Some(d("10000")),
+            },
+            activities: Vec::new(),
+            buy_fee_rate: CRYPTO_TIER1_MAKER_FEE_RATE,
+            fail_next_sell: false,
+            market_fill_price: default_bid,
+            next_seq: 1,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct T7MockBroker {
+    st: Arc<Mutex<T7BrokerState>>,
+}
+
+impl T7MockBroker {
+    fn new(state: T7BrokerState) -> Self {
+        Self {
+            st: Arc::new(Mutex::new(state)),
+        }
+    }
+
+    fn push_quote(&self, bid: Decimal, ask: Decimal, count: usize) {
+        let mut st = self.st.lock().unwrap();
+        for _ in 0..count {
+            st.quote_queue.push_back(QuoteDetail {
+                timestamp: Some("2026-11-25T10:00:00Z".into()),
+                bid_price: bid,
+                ask_price: ask,
+                bid_size: Some(d("10000")),
+                ask_size: Some(d("10000")),
+            });
+        }
+    }
+}
+
+#[async_trait]
+impl AlpacaApi for T7MockBroker {
+    async fn get_account(&self) -> Result<Account, AlpacaError> {
+        Ok(self.st.lock().unwrap().account.clone())
+    }
+
+    async fn get_position(&self, _symbol: &str) -> Result<Option<Position>, AlpacaError> {
+        Ok(self.st.lock().unwrap().position.clone())
+    }
+
+    async fn get_open_orders(&self, _symbol: Option<&str>) -> Result<Vec<Order>, AlpacaError> {
+        let st = self.st.lock().unwrap();
+        Ok(st.orders.values().filter(|o| o.is_open()).cloned().collect())
+    }
+
+    async fn get_order(&self, order_id: &str) -> Result<Order, AlpacaError> {
+        let st = self.st.lock().unwrap();
+        st.orders
+            .get(order_id)
+            .cloned()
+            .ok_or_else(|| AlpacaError::ApiStatus {
+                status: StatusCode::NOT_FOUND,
+                message: format!("Order {} not found", order_id),
+            })
+    }
+
+    async fn submit_order(&self, req: &OrderRequest) -> Result<Order, AlpacaError> {
+        let mut st = self.st.lock().unwrap();
+        let qty = Decimal::from_str(&req.qty).unwrap();
+        let limit_px = req
+            .limit_price
+            .as_deref()
+            .and_then(|s| Decimal::from_str(s).ok());
+        let is_crypto = req.symbol.contains('/');
+
+        if req.side == "buy" {
+            let seq = st.next_seq;
+            st.next_seq += 1;
+            let oid = format!("t7-buy-{}", seq);
+            let fill_px = limit_px.unwrap_or(st.default_quote.ask_price);
+            let net_qty = if is_crypto {
+                floor_qty(qty * (Decimal::ONE - st.buy_fee_rate), 9)
+            } else {
+                qty
+            };
+            st.account.cash = (st.account.cash - qty * fill_px).max(Decimal::ZERO);
+            match st.position {
+                Some(ref mut pos) => {
+                    let prev_cost = pos.qty * pos.avg_entry_price;
+                    let new_qty = pos.qty + net_qty;
+                    pos.avg_entry_price = if new_qty > Decimal::ZERO {
+                        (prev_cost + net_qty * fill_px) / new_qty
+                    } else {
+                        fill_px
+                    };
+                    pos.qty = new_qty;
+                    pos.qty_available += net_qty;
+                    pos.current_price = Some(fill_px);
+                    pos.market_value = Some(new_qty * fill_px);
+                }
+                None => {
+                    st.position = Some(Position {
+                        asset_id: Some("asset-t7".into()),
+                        symbol: req.symbol.replace('/', ""),
+                        exchange: Some("CRYPTO".into()),
+                        asset_class: Some("crypto".into()),
+                        qty: net_qty,
+                        qty_available: net_qty,
+                        avg_entry_price: fill_px,
+                        side: "long".into(),
+                        market_value: Some(net_qty * fill_px),
+                        cost_basis: Some(net_qty * fill_px),
+                        unrealized_pl: Some(Decimal::ZERO),
+                        current_price: Some(fill_px),
+                    });
+                }
+            }
+            let ord = Order {
+                id: oid.clone(),
+                client_order_id: req.client_order_id.clone(),
+                created_at: Some("2026-11-25T10:00:00Z".into()),
+                updated_at: Some("2026-11-25T10:00:01Z".into()),
+                submitted_at: Some("2026-11-25T10:00:00Z".into()),
+                filled_at: Some("2026-11-25T10:00:01Z".into()),
+                expired_at: None,
+                canceled_at: None,
+                failed_at: None,
+                symbol: req.symbol.clone(),
+                qty,
+                filled_qty: qty,
+                filled_avg_price: Some(fill_px),
+                order_class: Some("simple".into()),
+                side: "buy".into(),
+                order_type: req.order_type.clone(),
+                time_in_force: req.time_in_force.clone(),
+                limit_price: limit_px,
+                status: "filled".into(),
+            };
+            st.orders.insert(oid, ord.clone());
+            return Ok(ord);
+        }
+
+        if st.fail_next_sell {
+            st.fail_next_sell = false;
+            return Err(AlpacaError::ApiStatus {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: "Injected transient 500 on sell submit".into(),
+            });
+        }
+
+        let seq = st.next_seq;
+        st.next_seq += 1;
+        if req.order_type == "market" {
+            let oid = format!("t7-mkt-{}", seq);
+            let fill_px = st.market_fill_price;
+            if let Some(ref mut pos) = st.position {
+                pos.qty = (pos.qty - qty).max(Decimal::ZERO);
+                pos.qty_available = (pos.qty_available - qty).max(Decimal::ZERO);
+                if pos.qty <= Decimal::ZERO {
+                    st.position = None;
+                }
+            }
+            let cfee = ceil_usd_cents(qty * fill_px * CRYPTO_TIER1_TAKER_FEE_RATE);
+            st.account.cash += qty * fill_px - cfee;
+            st.activities.insert(
+                0,
+                AccountActivity {
+                    id: format!("cfee-{}", oid),
+                    activity_type: "CFEE".into(),
+                    order_id: Some(oid.clone()),
+                    symbol: Some(req.symbol.clone()),
+                    transaction_time: Some("2026-11-25T22:30:00Z".into()),
+                    date: Some("2026-11-25".into()),
+                    net_amount: Some(-cfee),
+                    qty: None,
+                    price: None,
+                    description: None,
+                    status: Some("executed".into()),
+                },
+            );
+            let ord = Order {
+                id: oid.clone(),
+                client_order_id: req.client_order_id.clone(),
+                created_at: Some("2026-11-25T22:30:00Z".into()),
+                updated_at: Some("2026-11-25T22:30:01Z".into()),
+                submitted_at: Some("2026-11-25T22:30:00Z".into()),
+                filled_at: Some("2026-11-25T22:30:01Z".into()),
+                expired_at: None,
+                canceled_at: None,
+                failed_at: None,
+                symbol: req.symbol.clone(),
+                qty,
+                filled_qty: qty,
+                filled_avg_price: Some(fill_px),
+                order_class: Some("simple".into()),
+                side: "sell".into(),
+                order_type: "market".into(),
+                time_in_force: req.time_in_force.clone(),
+                limit_price: None,
+                status: "filled".into(),
+            };
+            st.orders.insert(oid, ord.clone());
+            return Ok(ord);
+        }
+
+        let oid = format!("t7-sell-{}", seq);
+        if let Some(ref mut pos) = st.position {
+            pos.qty_available = (pos.qty_available - qty).max(Decimal::ZERO);
+        }
+        let ord = Order {
+            id: oid.clone(),
+            client_order_id: req.client_order_id.clone(),
+            created_at: Some("2026-11-25T10:00:02Z".into()),
+            updated_at: Some("2026-11-25T10:00:02Z".into()),
+            submitted_at: Some("2026-11-25T10:00:02Z".into()),
+            filled_at: None,
+            expired_at: None,
+            canceled_at: None,
+            failed_at: None,
+            symbol: req.symbol.clone(),
+            qty,
+            filled_qty: Decimal::ZERO,
+            filled_avg_price: None,
+            order_class: Some("simple".into()),
+            side: "sell".into(),
+            order_type: "limit".into(),
+            time_in_force: req.time_in_force.clone(),
+            limit_price: limit_px,
+            status: "new".into(),
+        };
+        st.orders.insert(oid, ord.clone());
+        Ok(ord)
+    }
+
+    async fn cancel_order(&self, order_id: &str) -> Result<bool, AlpacaError> {
+        let mut st = self.st.lock().unwrap();
+        let rem = match st.orders.get_mut(order_id) {
+            Some(ord) if ord.is_open() => {
+                let r = ord.remaining_qty();
+                ord.status = "canceled".into();
+                ord.canceled_at = Some("2026-11-25T22:30:00Z".into());
+                r
+            }
+            _ => return Ok(false),
+        };
+        if rem > Decimal::ZERO {
+            if let Some(ref mut pos) = st.position {
+                pos.qty_available = (pos.qty_available + rem).min(pos.qty);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn get_latest_quote(&self, _symbol: &str) -> Result<QuoteDetail, AlpacaError> {
+        let mut st = self.st.lock().unwrap();
+        Ok(st
+            .quote_queue
+            .pop_front()
+            .unwrap_or_else(|| st.default_quote.clone()))
+    }
+
+    async fn get_portfolio_history(
+        &self,
+        _period: &str,
+        _timeframe: &str,
+    ) -> Result<PortfolioHistory, AlpacaError> {
+        Ok(PortfolioHistory::default())
+    }
+
+    async fn get_account_activities(
+        &self,
+        _activity_types: &str,
+        _after: Option<&str>,
+    ) -> Result<Vec<AccountActivity>, AlpacaError> {
+        Ok(self.st.lock().unwrap().activities.clone())
+    }
+
+    async fn get_account_activities_page(
+        &self,
+        _activity_types: &str,
+        _after: Option<&str>,
+        page_token: Option<&str>,
+    ) -> Result<Vec<AccountActivity>, AlpacaError> {
+        if page_token.is_some() {
+            Ok(Vec::new())
+        } else {
+            Ok(self.st.lock().unwrap().activities.clone())
+        }
+    }
+}
+
+#[test]
+fn theorem7_1_bounds_numerical_immunity_and_corrupted_state_30000_trials() {
+    let prod_params: StrategyParams =
+        serde_json::from_str(include_str!("../params.json")).expect("valid params.json");
+    AppConfig::validate_params(&prod_params).expect("params.json must validate");
+    let rs = prod_params.regime_sizing.clone();
+    assert!((rs.min_notional_usd - 3000.0).abs() < 1e-12);
+    assert!((rs.max_notional_usd - 30000.0).abs() < 1e-12);
+    assert!((rs.min_total_exposure_usd - 15000.0).abs() < 1e-12);
+    assert!((rs.max_total_exposure_usd - 90000.0).abs() < 1e-12);
+
+    // 1. 30,000 adversarial & randomized ticks against production params
+    let mut ctrl = RegimeNotionalController::new(rs.clone(), None);
+    let mut rng = Rng64::new(0x7001_7002_7003_7004);
+
+    // Initial bad ticks before any valid tick must be pure no-ops
+    for &bad in &[f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -0.0, -1.0, f64::MIN] {
+        ctrl.update(bad);
+        assert_eq!(ctrl.state().sample_count, 0);
+        assert_eq!(ctrl.current_hunt_cap_usd(), d("3000"));
+        assert_eq!(ctrl.current_total_exposure_cap_usd(), d("15000"));
+    }
+
+    // Flat constant price for 5,000 cycles -> return_var must hit >= 1e-12 floor cleanly
+    for _ in 0..5_000 {
+        ctrl.update(75.0);
+        let st = ctrl.state();
+        assert!(st.ema_fast.is_finite() && st.ema_fast > 0.0);
+        assert!(st.ema_slow.is_finite() && st.ema_slow > 0.0);
+        assert!(st.return_var.is_finite() && st.return_var >= 1e-12);
+        assert!(st.smoothed_cap_usd.is_finite());
+        let h_cap = ctrl.current_hunt_cap_usd();
+        let e_cap = ctrl.current_total_exposure_cap_usd();
+        assert!(h_cap >= d("3000") && h_cap <= d("30000"));
+        assert!(e_cap >= h_cap && e_cap >= d("15000") && e_cap <= d("90000"));
+    }
+    assert!(
+        (ctrl.state().return_var - 1e-12).abs() < 1e-13,
+        "constant price return_var should converge to 1e-12 floor, got {}",
+        ctrl.state().return_var
+    );
+
+    // 25,000 extreme / mixed / 1000x-jump / alternating-spike / subnormal / NaN ticks
+    let extremes = [
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        0.0,
+        -1.0,
+        f64::MIN_POSITIVE,
+        5e-324_f64,
+        1e-100,
+        1e-4,
+        0.9999,
+        1.0,
+        1000.0,
+        1e6,
+        1e100,
+        1e300,
+        f64::MAX,
+    ];
+    for step in 0..25_000usize {
+        let mid = match step % 16 {
+            0 => extremes[(step / 16) % extremes.len()],
+            1 => 1e-100,
+            2 => 1e100,
+            3 => 1e-4,
+            4 => 100_000.0, // 1e9x spike
+            5 => 0.1,
+            _ => rng.log_uniform(1e-10, 1e10),
+        };
+        ctrl.update(mid);
+        let st = ctrl.state();
+        assert!(st.ema_fast.is_finite() && st.ema_fast > 0.0);
+        assert!(st.ema_slow.is_finite() && st.ema_slow > 0.0);
+        assert!(st.last_mid.is_finite() && st.last_mid > 0.0);
+        assert!(st.return_var.is_finite() && st.return_var >= 1e-12);
+        assert!(
+            st.smoothed_cap_usd.is_finite()
+                && st.smoothed_cap_usd >= 3000.0
+                && st.smoothed_cap_usd <= 30000.0
+        );
+        let h_cap = ctrl.current_hunt_cap_usd();
+        let e_cap = ctrl.current_total_exposure_cap_usd();
+        assert!(h_cap >= d("3000") && h_cap <= d("30000"));
+        assert!(e_cap >= h_cap && e_cap >= d("15000") && e_cap <= d("90000"));
+    }
+
+    // 2. Corrupted / out-of-range deserialized RegimeNotionalState recovery in ::new
+    let corrupted_cases = [
+        RegimeNotionalState {
+            ema_fast: 0.0,
+            ema_slow: 100.0,
+            last_mid: 100.0,
+            return_var: 1e-6,
+            smoothed_cap_usd: 15000.0,
+            sample_count: 100,
+            stale_cooldown_remaining: 0,
+        },
+        RegimeNotionalState {
+            ema_fast: 100.0,
+            ema_slow: f64::NAN,
+            last_mid: 100.0,
+            return_var: 1e-6,
+            smoothed_cap_usd: 15000.0,
+            sample_count: 100,
+            stale_cooldown_remaining: 0,
+        },
+        RegimeNotionalState {
+            ema_fast: 100.0,
+            ema_slow: 100.0,
+            last_mid: 100.0,
+            return_var: -5.0,
+            smoothed_cap_usd: 15000.0,
+            sample_count: 100,
+            stale_cooldown_remaining: 0,
+        },
+        RegimeNotionalState {
+            ema_fast: 100.0,
+            ema_slow: 100.0,
+            last_mid: 100.0,
+            return_var: 0.0,
+            smoothed_cap_usd: 1e9,
+            sample_count: 100,
+            stale_cooldown_remaining: 0,
+        },
+    ];
+    for bad_state in corrupted_cases {
+        let mut c = RegimeNotionalController::new(rs.clone(), Some(bad_state));
+        assert!(c.current_hunt_cap_usd() >= d("3000") && c.current_hunt_cap_usd() <= d("30000"));
+        assert!(c.current_total_exposure_cap_usd() >= c.current_hunt_cap_usd());
+        assert!(c.current_total_exposure_cap_usd() <= d("90000"));
+        c.update(100.0);
+        let st = c.state();
+        assert!(st.ema_fast.is_finite() && st.ema_fast > 0.0);
+        assert!(st.ema_slow.is_finite() && st.ema_slow > 0.0);
+        assert!(st.return_var.is_finite() && st.return_var >= 1e-12);
+    }
+
+    // 3. Positive Regression Proofs for T7.1 Edge Cases (CE-7.1a–d):
+    // Regression CE-7.1a: ema_fast_cycles = 1 + 1e100 -> 1.0 drop MUST equal 1.0 (convex EMA, zero cancellation!)
+    {
+        let mut p_fast1 = prod_params.clone();
+        p_fast1.regime_sizing.ema_fast_cycles = 1;
+        assert!(AppConfig::validate_params(&p_fast1).is_ok());
+        let mut c1 = RegimeNotionalController::new(p_fast1.regime_sizing, None);
+        c1.update(1e100);
+        c1.update(1.0);
+        assert!(
+            (c1.state().ema_fast - 1.0).abs() < 1e-12,
+            "CE-7.1a REGRESSION PROVEN: convex EMA update preserves ema_fast=1.0 when ema_fast_cycles=1, got {}",
+            c1.state().ema_fast
+        );
+        assert!(c1.state().is_valid());
+    }
+
+    // Regression CE-7.1b: corrupted sample_count = 0 with negative EMAs rejected; valid sample_count = 0 clamped cleanly
+    {
+        let crafted = RegimeNotionalState {
+            ema_fast: -50.0,
+            ema_slow: 0.0,
+            last_mid: -1.0,
+            return_var: 0.0,
+            smoothed_cap_usd: 1e9,
+            sample_count: 0,
+            stale_cooldown_remaining: 0,
+        };
+        assert!(
+            !crafted.is_valid(),
+            "CE-7.1b REGRESSION PROVEN: is_valid must reject sample_count=0 with negative EMAs"
+        );
+        let c_crafted = RegimeNotionalController::new(rs.clone(), Some(crafted));
+        assert!(c_crafted.state().return_var >= 1e-12);
+        assert_eq!(c_crafted.state().ema_fast, 0.0);
+        assert_eq!(c_crafted.current_hunt_cap_usd(), d("3000"));
+
+        let valid_zero = RegimeNotionalState {
+            ema_fast: 0.0,
+            ema_slow: 0.0,
+            last_mid: 0.0,
+            return_var: 0.0,
+            smoothed_cap_usd: 1e9,
+            sample_count: 0,
+            stale_cooldown_remaining: 0,
+        };
+        assert!(valid_zero.is_valid());
+        let c_zero = RegimeNotionalController::new(rs.clone(), Some(valid_zero));
+        assert!(c_zero.state().return_var >= 1e-12);
+        assert_eq!(c_zero.current_hunt_cap_usd(), d("3000"));
+    }
+
+    // Regression CE-7.1c: deserialized sample_count = u64::MAX saturates cleanly on update()
+    {
+        let max_sc_state = RegimeNotionalState {
+            ema_fast: 100.0,
+            ema_slow: 100.0,
+            last_mid: 100.0,
+            return_var: 1e-6,
+            smoothed_cap_usd: 3000.0,
+            sample_count: u64::MAX,
+            stale_cooldown_remaining: 0,
+        };
+        assert!(max_sc_state.is_valid());
+        let mut c_ovf = RegimeNotionalController::new(rs.clone(), Some(max_sc_state));
+        c_ovf.update(100.0);
+        assert_eq!(
+            c_ovf.state().sample_count,
+            u64::MAX,
+            "CE-7.1c REGRESSION PROVEN: sample_count must saturate at u64::MAX without overflow or wrap"
+        );
+        assert!(c_ovf.state().is_valid());
+    }
+
+    // Regression CE-7.1d: validate_params rejects max_notional_usd > max_total_exposure_usd,
+    // and sanitize_bounds guarantees total exposure cap >= hunt cap even for unvalidated params
+    {
+        let mut p_inconsistent = prod_params.clone();
+        p_inconsistent.regime_sizing.max_notional_usd = 50_000.0;
+        p_inconsistent.regime_sizing.max_total_exposure_usd = 30_000.0;
+        assert!(
+            AppConfig::validate_params(&p_inconsistent).is_err(),
+            "CE-7.1d REGRESSION PROVEN: validate_params must reject max_notional_usd > max_total_exposure_usd"
+        );
+        let high_st = RegimeNotionalState {
+            ema_fast: 150.0,
+            ema_slow: 100.0,
+            last_mid: 150.0,
+            return_var: 1e-6,
+            smoothed_cap_usd: 50_000.0,
+            sample_count: 1000,
+            stale_cooldown_remaining: 0,
+        };
+        let c_inc = RegimeNotionalController::new(p_inconsistent.regime_sizing, Some(high_st));
+        assert_eq!(c_inc.current_hunt_cap_usd(), d("50000"));
+        assert!(
+            c_inc.current_total_exposure_cap_usd() >= c_inc.current_hunt_cap_usd(),
+            "CE-7.1d REGRESSION PROVEN: total_exposure_cap {} must remain >= hunt_cap {}",
+            c_inc.current_total_exposure_cap_usd(),
+            c_inc.current_hunt_cap_usd()
+        );
+    }
+
+    println!(
+        "[THEOREM 7.1 PROVEN] 30,000 ticks + CE-7.1a–d regressions (convex EMA, sample_count=0 sanitization, u64::MAX saturation, exposure/notional consistency) strictly invariant-safe"
+    );
+}
+
+#[tokio::test]
+async fn theorem7_2_asymmetric_dynamics_closed_form_and_stale_cooldown() {
+    let prod_params: StrategyParams =
+        serde_json::from_str(include_str!("../params.json")).expect("valid params.json");
+    let rs = prod_params.regime_sizing.clone();
+
+    // 1. Exact 720-cycle (6h) warmup gate: cap stays strictly $3,000 during strong rally
+    let mut ctrl = RegimeNotionalController::new(rs.clone(), None);
+    let mut price = 100.0_f64;
+    for cycle in 1..=720 {
+        price *= 1.001;
+        ctrl.update(price);
+        assert_eq!(
+            ctrl.current_hunt_cap_usd(),
+            d("3000"),
+            "warmup cycle {} must remain locked at $3,000",
+            cycle
+        );
+    }
+    // Cycle 721 (sample_count == 720 at entry) unlocks ramp
+    price *= 1.001;
+    ctrl.update(price);
+    assert!(
+        ctrl.current_hunt_cap_usd() > d("3000"),
+        "cycle 721 must begin ramping above $3,000"
+    );
+
+    // 2. Closed-form exponential convergence verification: C_k = C_target - (C_target - C_0)(1 - alpha)^k
+    //    When z_reg is saturated at +20.0 (strong bull trend), sig = 1/(1+exp(-2*(20-0.25))) = 1.0
+    //    to IEEE-754 double precision (exp(-39.5) < 1e-17), so target_usd == 30_000.0 constant!
+    let mut ramp_ctrl = RegimeNotionalController::new(
+        rs.clone(),
+        Some(RegimeNotionalState {
+            ema_fast: 200.0,
+            ema_slow: 100.0,
+            last_mid: 200.0,
+            return_var: 1e-12,
+            smoothed_cap_usd: 3000.0,
+            sample_count: 1000,
+            stale_cooldown_remaining: 0,
+        }),
+    );
+    let c0 = 3000.0_f64;
+    let c_target = 30000.0_f64;
+    let alpha = rs.ramp_up_alpha; // 0.01
+    for k in 1..=300usize {
+        ramp_ctrl.update(200.0);
+        let exact = c_target - (c_target - c0) * (1.0 - alpha).powi(k as i32);
+        let actual = ramp_ctrl.state().smoothed_cap_usd;
+        assert!(
+            (actual - exact).abs() < 1e-8,
+            "step {} closed-form mismatch: actual={} exact={}",
+            k,
+            actual,
+            exact
+        );
+        if k == 69 {
+            let frac = (actual - c0) / (c_target - c0);
+            assert!(
+                (0.50..0.506).contains(&frac),
+                "t_50 must occur at k=69 cycles (34.5m), got frac={}",
+                frac
+            );
+        }
+        if k == 229 {
+            let frac = (actual - c0) / (c_target - c0);
+            assert!((0.899..0.90).contains(&frac), "k=229 frac={}", frac);
+        }
+        if k == 230 {
+            let frac = (actual - c0) / (c_target - c0);
+            assert!((0.90..0.902).contains(&frac), "t_90 crossing at k=230 frac={}", frac);
+        }
+    }
+
+    // 3. 1-cycle instant downward response across 1,000 randomized states
+    let mut rng = Rng64::new(0x7201_7202_7203_7204);
+    for _ in 0..1_000 {
+        let ema_f = rng.range_f64(50.0, 150.0);
+        let ema_s = rng.range_f64(50.0, 150.0);
+        let last_m = rng.range_f64(50.0, 150.0);
+        let rv = rng.log_uniform(1e-12, 1e-2);
+        let next_m = rng.range_f64(40.0, 140.0);
+
+        // Controller starting at max cap (30,000) computes exact 1-step target_usd whenever target_usd <= 30,000
+        let mut c_target_probe = RegimeNotionalController::new(
+            rs.clone(),
+            Some(RegimeNotionalState {
+                ema_fast: ema_f,
+                ema_slow: ema_s,
+                last_mid: last_m,
+                return_var: rv,
+                smoothed_cap_usd: 30_000.0,
+                sample_count: 1000,
+                stale_cooldown_remaining: 0,
+            }),
+        );
+        c_target_probe.update(next_m);
+        let target_usd = c_target_probe.state().smoothed_cap_usd;
+
+        // Any controller with smoothed_cap_usd >= target_usd MUST snap directly to target_usd in 1 cycle
+        let higher_cap = rng.range_f64(target_usd, 30_000.0);
+        let mut c = RegimeNotionalController::new(
+            rs.clone(),
+            Some(RegimeNotionalState {
+                ema_fast: ema_f,
+                ema_slow: ema_s,
+                last_mid: last_m,
+                return_var: rv,
+                smoothed_cap_usd: higher_cap,
+                sample_count: 1000,
+                stale_cooldown_remaining: 0,
+            }),
+        );
+        c.update(next_m);
+        assert!(
+            (c.state().smoothed_cap_usd - target_usd).abs() < 1e-12,
+            "instant 1-cycle downward drop failed: got {} vs target {} (started at {})",
+            c.state().smoothed_cap_usd,
+            target_usd,
+            higher_cap
+        );
+    }
+
+    // 4. Stale liquidation cooldown: exact 1,440 cycles (12h) at $3,000 before resuming ramp
+    ramp_ctrl.on_stale_liquidation();
+    assert_eq!(ramp_ctrl.current_hunt_cap_usd(), d("3000"));
+    assert_eq!(ramp_ctrl.current_total_exposure_cap_usd(), d("15000"));
+    assert_eq!(ramp_ctrl.state().stale_cooldown_remaining, 1440);
+    for cycle in 1..=1440 {
+        ramp_ctrl.update(200.0);
+        assert_eq!(
+            ramp_ctrl.current_hunt_cap_usd(),
+            d("3000"),
+            "cooldown cycle {} of 1440 must remain locked at $3,000",
+            cycle
+        );
+    }
+    assert_eq!(ramp_ctrl.state().stale_cooldown_remaining, 0);
+    ramp_ctrl.update(200.0);
+    assert!(
+        ramp_ctrl.current_hunt_cap_usd() > d("3000"),
+        "cycle 1441 after stale liquidation must resume upward ramp"
+    );
+
+    // 5. End-to-end TradingEngine stale-count detection when trades_history ALREADY has 50 LiquidatedStale hunts!
+    let tmp = tempdir().unwrap();
+    let broker = T7MockBroker::new(T7BrokerState::new(d("1000000"), d("100.00"), d("100.02")));
+    let base_ts = DateTime::parse_from_rfc3339("2026-11-25T10:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+
+    let mut initial_hunts: Vec<TradeRecord> = (0..50)
+        .map(|i| TradeRecord {
+            id: format!("old-stale-{}", i),
+            symbol: "SOL/USD".into(),
+            buy_order_id: Some(format!("ob-{}", i)),
+            sell_order_id: Some(format!("os-{}", i)),
+            buy_qty: d("30"),
+            qty: d("29.955"),
+            filled_exit_qty: d("29.955"),
+            buy_price: d("100.00"),
+            sell_price: Some(d("99.00")),
+            pnl: Some(d("-35.00")),
+            pnl_pct: Some(d("-0.0117")),
+            gross_pnl: Some(d("-30.00")),
+            fees_usd: Some(d("5.00")),
+            buy_timestamp: "2026-11-20T00:00:00Z".into(),
+            sell_timestamp: Some("2026-11-20T12:00:00Z".into()),
+            status: HuntStatus::LiquidatedStale,
+            adopted_from_broker: false,
+            recovered_orphan: false,
+            buy_fee_already_deducted: Some(true),
+        })
+        .collect();
+
+    // Seed 1 active OpenExitPending hunt created >12h before test_ts
+    let active_sell_id = "open-stale-sell-51".to_string();
+    initial_hunts.push(TradeRecord {
+        id: "active-51".into(),
+        symbol: "SOL/USD".into(),
+        buy_order_id: Some("ob-51".into()),
+        sell_order_id: Some(active_sell_id.clone()),
+        buy_qty: d("100"),
+        qty: d("99.85"),
+        filled_exit_qty: Decimal::ZERO,
+        buy_price: d("100.00"),
+        sell_price: Some(d("102.00")),
+        pnl: None,
+        pnl_pct: None,
+        gross_pnl: None,
+        fees_usd: None,
+        buy_timestamp: base_ts.to_rfc3339(),
+        sell_timestamp: None,
+        status: HuntStatus::OpenExitPending,
+        adopted_from_broker: false,
+        recovered_orphan: false,
+        buy_fee_already_deducted: Some(true),
+    });
+
+    {
+        let mut st = broker.st.lock().unwrap();
+        st.position = Some(Position {
+            asset_id: Some("sol".into()),
+            symbol: "SOLUSD".into(),
+            exchange: Some("CRYPTO".into()),
+            asset_class: Some("crypto".into()),
+            qty: d("99.85"),
+            qty_available: Decimal::ZERO,
+            avg_entry_price: d("100.00"),
+            side: "long".into(),
+            market_value: Some(d("9985")),
+            cost_basis: Some(d("9985")),
+            unrealized_pl: Some(Decimal::ZERO),
+            current_price: Some(d("100.00")),
+        });
+        st.orders.insert(
+            active_sell_id.clone(),
+            Order {
+                id: active_sell_id,
+                client_order_id: None,
+                created_at: Some(base_ts.to_rfc3339()),
+                updated_at: Some(base_ts.to_rfc3339()),
+                submitted_at: Some(base_ts.to_rfc3339()),
+                filled_at: None,
+                expired_at: None,
+                canceled_at: None,
+                failed_at: None,
+                symbol: "SOL/USD".into(),
+                qty: d("99.85"),
+                filled_qty: Decimal::ZERO,
+                filled_avg_price: None,
+                order_class: Some("simple".into()),
+                side: "sell".into(),
+                order_type: "limit".into(),
+                time_in_force: "gtc".into(),
+                limit_price: Some(d("102.00")),
+                status: "new".into(),
+            },
+        );
+    }
+
+    let store = StateStore::new(tmp.path());
+    store.save_hunts(&initial_hunts, 50).unwrap();
+    store
+        .save_regime_state(&RegimeNotionalState {
+            ema_fast: 150.0,
+            ema_slow: 100.0,
+            last_mid: 150.0,
+            return_var: 1e-6,
+            smoothed_cap_usd: 30_000.0,
+            sample_count: 1000,
+            stale_cooldown_remaining: 0,
+        })
+        .unwrap();
+
+    let mut engine = TradingEngine::with_client_and_timing(
+        prod_params,
+        tmp.path(),
+        broker,
+        EngineTiming::fast_for_tests(),
+    );
+    assert_eq!(engine.regime_ctrl().current_hunt_cap_usd(), d("30000"));
+    assert_eq!(
+        engine
+            .trades_history()
+            .iter()
+            .filter(|h| h.status == HuntStatus::LiquidatedStale)
+            .count(),
+        50
+    );
+
+    // Run cycle at +12h30m -> stale_before=50, stale_after=51 BEFORE trim -> must trigger cooldown!
+    let _snap = engine
+        .step_cycle_at(base_ts + ChronoDuration::minutes(750), None)
+        .await
+        .unwrap();
+
+    assert_eq!(engine.regime_ctrl().current_hunt_cap_usd(), d("3000"));
+    assert_eq!(engine.regime_ctrl().state().stale_cooldown_remaining, 1440);
+    assert_eq!(
+        engine
+            .trades_history()
+            .iter()
+            .filter(|h| h.status == HuntStatus::LiquidatedStale)
+            .count(),
+        50,
+        "post-detection trim should cap terminal hunts back to 50"
+    );
+    assert!(
+        engine.trades_history().iter().any(|h| h.id == "active-51" && h.status == HuntStatus::LiquidatedStale),
+        "newly stale hunt active-51 must be preserved as latest terminal LiquidatedStale"
+    );
+
+    println!(
+        "[THEOREM 7.2 PROVEN] 720-cycle warmup, closed-form alpha=0.01 ramp (t50=69, t90~229.1), 1-cycle downward clamp, 1440-cycle cooldown, & 50-terminal stale detection passed"
+    );
+}
+
+#[tokio::test]
+async fn theorem7_3_decimal_conservation_30000_trials_and_exposure_audit() {
+    let min_m = 0.0036;
+    let max_m = 0.0250;
+    let mut rng = Rng64::new(0x7301_7302_7303_7304);
+    let mut nonzero_count = 0usize;
+
+    let ugly_prices = [
+        d("0.0001"),
+        d("0.0003"),
+        d("0.0099"),
+        d("0.9999"),
+        d("1.00"),
+        d("1.01"),
+        d("3.00"),
+        d("73.33"),
+        d("999.99"),
+        d("99999.99"),
+    ];
+
+    // 1. 30,000 randomized & boundary trials over realistic + high-precision Decimal budgets
+    for i in 0..30_000usize {
+        let is_crypto = i % 2 == 0;
+        let level = match i % 3 {
+            0 => 0.05,
+            1 => 0.5,
+            _ => 1.5,
+        };
+        let margin = match i % 10 {
+            0 => rng.range_f64(-0.01, min_m - 1e-9),
+            1 => rng.range_f64(max_m + 1e-9, 0.25),
+            2 => min_m,
+            3 => max_m,
+            4 => f64::NAN,
+            5 => f64::INFINITY,
+            _ => rng.range_f64(min_m, max_m),
+        };
+
+        let max_notional = if i % 25 == 0 {
+            d("29999.999999999999999999999999")
+        } else {
+            decimal_from_f64_clean(rng.log_uniform(1.0, 500_000.0))
+                .unwrap()
+                .round_dp(2)
+        };
+        let remaining_exp = match i % 12 {
+            0 => d("9.99"),
+            1 => Decimal::ZERO,
+            2 => d("-10.00"),
+            3 => d("29.999999999999999999999999999"),
+            _ => decimal_from_f64_clean(rng.log_uniform(1.0, 500_000.0))
+                .unwrap()
+                .round_dp(2),
+        };
+        let available_cash = match i % 11 {
+            0 => d("9.99"),
+            1 => Decimal::ZERO,
+            2 => d("29.999999999999999999999999999"),
+            _ => decimal_from_f64_clean(rng.log_uniform(1.0, 500_000.0))
+                .unwrap()
+                .round_dp(2),
+        };
+        let buy_price = if i % 5 == 0 {
+            ugly_prices[i % ugly_prices.len()]
+        } else {
+            floor_to_tick(decimal_from_f64_clean(rng.log_uniform(0.0001, 100_000.0)).unwrap())
+                .max(d("0.0001"))
+        };
+
+        let q = calculate_notional_capped_shares(
+            margin,
+            min_m,
+            max_m,
+            level,
+            max_notional,
+            remaining_exp,
+            available_cash,
+            buy_price,
+            is_crypto,
+        );
+
+        let min_cap = max_notional
+            .min(remaining_exp.max(Decimal::ZERO))
+            .min(available_cash.max(Decimal::ZERO));
+        let notional = q * buy_price;
+        assert!(q >= Decimal::ZERO);
+        assert!(
+            notional <= min_cap,
+            "NOTIONAL CAP VIOLATED: q={} * px={} = {} > min_cap={} (max_n={}, rem={}, cash={})",
+            q,
+            buy_price,
+            notional,
+            min_cap,
+            max_notional,
+            remaining_exp,
+            available_cash
+        );
+        if !margin.is_finite() || margin < min_m || margin > max_m {
+            assert_eq!(q, Decimal::ZERO);
+        }
+        if remaining_exp < MIN_ORDER_NOTIONAL_USD || available_cash < MIN_ORDER_NOTIONAL_USD {
+            assert_eq!(q, Decimal::ZERO);
+        }
+        if q > Decimal::ZERO {
+            assert!(
+                notional >= MIN_ORDER_NOTIONAL_USD,
+                "MIN NOTIONAL VIOLATED: {} < $10.00",
+                notional
+            );
+            if !is_crypto {
+                assert_eq!(q, q.floor(), "Equity share count must be integer");
+            }
+            nonzero_count += 1;
+        }
+    }
+
+    // 2. 29-digit Decimal::MAX probes:
+    //    (a) Verify factor * Decimal::MAX does not panic in calculate_notional_capped_shares
+    let dec_max_res = std::panic::catch_unwind(|| {
+        calculate_notional_capped_shares(
+            0.0200,
+            min_m,
+            max_m,
+            0.05,
+            Decimal::MAX,
+            d("1000"),
+            d("1000"),
+            d("73.33"),
+            true,
+        )
+    });
+    assert!(dec_max_res.is_ok(), "factor * Decimal::MAX panicked");
+    let q_max = dec_max_res.unwrap();
+    assert!(q_max * d("73.33") <= d("1000") && q_max * d("73.33") >= d("10"));
+
+    //    (b) REGRESSION CE-7.3a: 29-digit raw_qty stagnation in finalize_floored_qty terminates cleanly!
+    //        cap = 5e25, buy_price = 3, is_crypto = true (step = 0.0001):
+    //        5e25 / 3 = 16666666666666666666666666.667 (scale 3, 29 digits), where qty - step == qty.
+    //        finalize_floored_qty detects next >= qty and returns Decimal::ZERO immediately.
+    {
+        let cap = d("50000000000000000000000000");
+        let px = d("3");
+        let raw_qty = cap.checked_div(px).unwrap();
+        let qty = floor_qty(raw_qty, 4);
+        let step = Decimal::new(1, 4);
+        assert_eq!(qty - step, qty);
+        assert!(qty.checked_mul(px).is_none_or(|n| n > cap));
+
+        let q_safe = calculate_notional_capped_shares(0.0250, 0.0036, 0.0250, 0.05, cap, cap, cap, px, true);
+        assert_eq!(
+            q_safe,
+            Decimal::ZERO,
+            "CE-7.3a REGRESSION PROVEN: 29-digit stagnation returns 0 cleanly without infinite loop"
+        );
+        assert!(q_safe * px <= cap);
+    }
+
+    // 3. active_exposure_usd audit in TradingEngine::step_cycle_at:
+    //    (a) Normal ExitPartiallyFilled accurately tracks (qty - filled_exit_qty) * buy_price
+    {
+        let tmp = tempdir().unwrap();
+        let mut params = default_sol_params();
+        params.regime_sizing = RegimeSizingParams {
+            min_notional_usd: 3000.0,
+            max_notional_usd: 30000.0,
+            min_total_exposure_usd: 15000.0,
+            max_total_exposure_usd: 15000.0,
+            ema_fast_cycles: 4,
+            ema_slow_cycles: 20,
+            vol_cycles: 4,
+            ramp_up_alpha: 0.5,
+            stale_cooldown_cycles: 10,
+            ..Default::default()
+        };
+        let broker = T7MockBroker::new(T7BrokerState::new(d("1000000"), d("100.00"), d("100.02")));
+        let base_ts = DateTime::parse_from_rfc3339("2026-11-25T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let sell_oid = "partial-sell-1".to_string();
+        let partial_hunt = TradeRecord {
+            id: "part-1".into(),
+            symbol: "SOL/USD".into(),
+            buy_order_id: Some("pb-1".into()),
+            sell_order_id: Some(sell_oid.clone()),
+            buy_qty: d("130"),
+            qty: d("130"),
+            filled_exit_qty: Decimal::ZERO,
+            buy_price: d("100.00"),
+            sell_price: Some(d("102.00")),
+            pnl: None,
+            pnl_pct: None,
+            gross_pnl: None,
+            fees_usd: None,
+            buy_timestamp: base_ts.to_rfc3339(),
+            sell_timestamp: None,
+            status: HuntStatus::OpenExitPending,
+            adopted_from_broker: false,
+            recovered_orphan: false,
+            buy_fee_already_deducted: Some(true),
+        };
+        StateStore::new(tmp.path())
+            .save_hunts(&[partial_hunt], 50)
+            .unwrap();
+        {
+            let mut st = broker.st.lock().unwrap();
+            st.position = Some(Position {
+                asset_id: Some("sol".into()),
+                symbol: "SOLUSD".into(),
+                exchange: Some("CRYPTO".into()),
+                asset_class: Some("crypto".into()),
+                qty: d("50"),
+                qty_available: Decimal::ZERO,
+                avg_entry_price: d("100.00"),
+                side: "long".into(),
+                market_value: Some(d("5000")),
+                cost_basis: Some(d("5000")),
+                unrealized_pl: Some(Decimal::ZERO),
+                current_price: Some(d("100.00")),
+            });
+            st.orders.insert(
+                sell_oid.clone(),
+                Order {
+                    id: sell_oid,
+                    client_order_id: None,
+                    created_at: Some(base_ts.to_rfc3339()),
+                    updated_at: Some(base_ts.to_rfc3339()),
+                    submitted_at: Some(base_ts.to_rfc3339()),
+                    filled_at: None,
+                    expired_at: None,
+                    canceled_at: None,
+                    failed_at: None,
+                    symbol: "SOL/USD".into(),
+                    qty: d("130"),
+                    filled_qty: d("80"), // 80 sold -> 50 remaining ($5,000 exposure!)
+                    filled_avg_price: Some(d("102.00")),
+                    order_class: Some("simple".into()),
+                    side: "sell".into(),
+                    order_type: "limit".into(),
+                    time_in_force: "gtc".into(),
+                    limit_price: Some(d("102.00")),
+                    status: "partially_filled".into(),
+                },
+            );
+        }
+        let mut engine = TradingEngine::with_client_and_timing(
+            params,
+            tmp.path(),
+            broker.clone(),
+            EngineTiming::fast_for_tests(),
+        );
+        // Warm Kalman to ~100, then trigger dip
+        broker.push_quote(d("100.00"), d("100.02"), 1);
+        engine.step_cycle_at(base_ts, None).await.unwrap();
+        broker.push_quote(d("99.00"), d("99.02"), 2);
+        let snap = engine
+            .step_cycle_at(base_ts + ChronoDuration::seconds(30), None)
+            .await
+            .unwrap();
+        // Remaining exposure was $15,000 - $5,000 = $10,000; hunt cap is $3,000 -> new hunt sized <= $3,000!
+        assert_eq!(snap.active_hunts_count, 2);
+        let h2 = engine.trades_history().last().unwrap();
+        assert!(h2.buy_qty * h2.buy_price <= d("3000"));
+    }
+
+    //    (b) REGRESSION CE-7.3b: Step C preserves non-zero sub-$0.0001 avg_entry_ref (0.00004)
+    //        and active_exposure_usd marks to max(buy_price, mid) & broker exposure, blocking excess buys!
+    {
+        let tmp = tempdir().unwrap();
+        let mut params = default_sol_params();
+        params.regime_sizing = RegimeSizingParams {
+            min_notional_usd: 3000.0,
+            max_notional_usd: 3000.0,
+            min_total_exposure_usd: 15000.0,
+            max_total_exposure_usd: 15000.0,
+            ema_fast_cycles: 4,
+            ema_slow_cycles: 20,
+            vol_cycles: 4,
+            ramp_up_alpha: 0.5,
+            stale_cooldown_cycles: 10,
+            ..Default::default()
+        };
+        let broker =
+            T7MockBroker::new(T7BrokerState::new(d("1000000"), d("0.0100"), d("0.0102")));
+        let base_ts = DateTime::parse_from_rfc3339("2026-11-25T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // Existing broker position: 500,000,000 units @ avg_entry=$0.00004 ($20,000 cost, > $15,000 cap!)
+        // Protected by an external open sell order adopted by Step C!
+        {
+            let mut st = broker.st.lock().unwrap();
+            st.position = Some(Position {
+                asset_id: Some("meme".into()),
+                symbol: "SOLUSD".into(),
+                exchange: Some("CRYPTO".into()),
+                asset_class: Some("crypto".into()),
+                qty: d("500000000"),
+                qty_available: Decimal::ZERO,
+                avg_entry_price: d("0.00004"),
+                side: "long".into(),
+                market_value: Some(d("5000000")),
+                cost_basis: Some(d("20000")),
+                unrealized_pl: Some(Decimal::ZERO),
+                current_price: Some(d("0.0100")),
+            });
+            st.orders.insert(
+                "ext-sell-1".into(),
+                Order {
+                    id: "ext-sell-1".into(),
+                    client_order_id: None,
+                    created_at: Some(base_ts.to_rfc3339()),
+                    updated_at: Some(base_ts.to_rfc3339()),
+                    submitted_at: Some(base_ts.to_rfc3339()),
+                    filled_at: None,
+                    expired_at: None,
+                    canceled_at: None,
+                    failed_at: None,
+                    symbol: "SOL/USD".into(),
+                    qty: d("500000000"),
+                    filled_qty: Decimal::ZERO,
+                    filled_avg_price: None,
+                    order_class: Some("simple".into()),
+                    side: "sell".into(),
+                    order_type: "limit".into(),
+                    time_in_force: "gtc".into(),
+                    limit_price: Some(d("0.05")),
+                    status: "new".into(),
+                },
+            );
+        }
+        let mut engine = TradingEngine::with_client_and_timing(
+            params,
+            tmp.path(),
+            broker.clone(),
+            EngineTiming::fast_for_tests(),
+        );
+        // Cycle 1: adopts ext-sell-1 preserving sub-4dp avg_entry_ref = 0.00004!
+        broker.push_quote(d("0.0100"), d("0.0102"), 1);
+        engine.step_cycle_at(base_ts, None).await.unwrap();
+        assert_eq!(engine.trades_history().len(), 1);
+        assert_eq!(
+            engine.trades_history()[0].buy_price,
+            d("0.00004"),
+            "CE-7.3b REGRESSION PROVEN: Step C preserves non-zero sub-4dp buy_price 0.00004"
+        );
+        // Cycle 2: 1.48% dip MUST NOT trigger a new buy while broker already holds $20,000 cost ($5M MV) > $15,000 cap!
+        broker.push_quote(d("0.0099"), d("0.0100"), 2);
+        let snap2 = engine
+            .step_cycle_at(base_ts + ChronoDuration::seconds(30), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            snap2.active_hunts_count, 1,
+            "CE-7.3b REGRESSION PROVEN: exposure floor blocks new buys above $15k cap"
+        );
+    }
+
+    //    (c) REGRESSION CE-7.3c: Broker inventory floor prevents untracked/deferred positions
+    //        from allowing new buys when broker_exposure_usd >= max_total_exposure_usd!
+    {
+        let tmp = tempdir().unwrap();
+        let mut params = default_sol_params();
+        params.regime_sizing = RegimeSizingParams {
+            min_notional_usd: 3000.0,
+            max_notional_usd: 3000.0,
+            min_total_exposure_usd: 15000.0,
+            max_total_exposure_usd: 15000.0,
+            ema_fast_cycles: 4,
+            ema_slow_cycles: 20,
+            vol_cycles: 4,
+            ramp_up_alpha: 0.5,
+            stale_cooldown_cycles: 10,
+            ..Default::default()
+        };
+        let broker = T7MockBroker::new(T7BrokerState::new(d("1000000"), d("100.00"), d("100.02")));
+        let base_ts = DateTime::parse_from_rfc3339("2026-11-25T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // 1 active ExitSubmitPending hunt ($3,000) + $20,000 untracked broker position,
+        // and next sell retry fails so has_submit_pending stays true (Step D skipped!)
+        let pending_hunt = TradeRecord {
+            id: "pend-1".into(),
+            symbol: "SOL/USD".into(),
+            buy_order_id: Some("pb-p1".into()),
+            sell_order_id: None,
+            buy_qty: d("30"),
+            qty: d("29.955"),
+            filled_exit_qty: Decimal::ZERO,
+            buy_price: d("100.00"),
+            sell_price: Some(d("101.00")),
+            pnl: None,
+            pnl_pct: None,
+            gross_pnl: None,
+            fees_usd: None,
+            buy_timestamp: base_ts.to_rfc3339(),
+            sell_timestamp: None,
+            status: HuntStatus::ExitSubmitPending,
+            adopted_from_broker: false,
+            recovered_orphan: false,
+            buy_fee_already_deducted: Some(true),
+        };
+        StateStore::new(tmp.path())
+            .save_hunts(&[pending_hunt], 50)
+            .unwrap();
+        {
+            let mut st = broker.st.lock().unwrap();
+            st.fail_next_sell = true; // keeps pend-1 in ExitSubmitPending so Step D is skipped
+            st.position = Some(Position {
+                asset_id: Some("sol".into()),
+                symbol: "SOLUSD".into(),
+                exchange: Some("CRYPTO".into()),
+                asset_class: Some("crypto".into()),
+                qty: d("230"), // $23,000 broker position (> $15,000 exposure cap!)
+                qty_available: d("230"),
+                avg_entry_price: d("100.00"),
+                side: "long".into(),
+                market_value: Some(d("23000")),
+                cost_basis: Some(d("23000")),
+                unrealized_pl: Some(Decimal::ZERO),
+                current_price: Some(d("100.00")),
+            });
+        }
+        let mut engine = TradingEngine::with_client_and_timing(
+            params,
+            tmp.path(),
+            broker.clone(),
+            EngineTiming::fast_for_tests(),
+        );
+        broker.push_quote(d("100.00"), d("100.02"), 1);
+        engine.step_cycle_at(base_ts, None).await.unwrap();
+        broker.st.lock().unwrap().fail_next_sell = true;
+        broker.push_quote(d("99.00"), d("99.02"), 2);
+        let snap = engine
+            .step_cycle_at(base_ts + ChronoDuration::seconds(30), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            snap.active_hunts_count, 1,
+            "CE-7.3c REGRESSION PROVEN: broker inventory exposure ($23,000) blocks new hunt above $15k cap"
+        );
+    }
+
+    println!(
+        "[THEOREM 7.3 PROVEN] 30,000 realistic trials ({} nonzero) strictly conserved caps + CE-7.3a–c regressions (29-digit termination, Step C sub-4dp preservation, broker inventory exposure floor) passed",
+        nonzero_count
+    );
+}
+
+#[tokio::test]
+async fn theorem7_4_zero_regression_on_theorems_1_to_6() {
+    let params = default_sol_params();
+    let now = Utc::now();
+    let mut rng = Rng64::new(0x7401_7402_7403_7404);
+
+    // 1. 40 randomized execute_hunt_with_notional_cap runs verifying Theorems 1, 2, 4, 5, 6
+    for i in 0..40usize {
+        let tmp = tempdir().unwrap();
+        let store = StateStore::new(tmp.path());
+        let bid = decimal_from_f64_clean(rng.range_f64(20.0, 250.0))
+            .unwrap()
+            .round_dp(2);
+        let spread = if i % 5 == 0 { d("0.01") } else { d("0.04") };
+        let ask = bid + spread;
+        let fair_mult = 1.0 + rng.range_f64(0.0038, 0.0245);
+        let fair_price = decimal_to_f64(bid) * fair_mult;
+
+        let hunt_cap = decimal_from_f64_clean(rng.range_f64(3000.0, 30000.0))
+            .unwrap()
+            .round_dp(2);
+        let rem_exp = decimal_from_f64_clean(rng.range_f64(500.0, 45000.0))
+            .unwrap()
+            .round_dp(2);
+        let cash = decimal_from_f64_clean(rng.range_f64(500.0, 50000.0))
+            .unwrap()
+            .round_dp(2);
+
+        let mut broker_st = T7BrokerState::new(cash, bid, ask);
+        if i % 4 == 0 {
+            // Inject transient sell failure to verify crash-safe ExitSubmitPending pre-persistence + Step A recovery (Theorem 5)
+            broker_st.fail_next_sell = true;
+        }
+        let broker = T7MockBroker::new(broker_st);
+        let mut trades = Vec::new();
+        let mut fee_tracker = FeeTracker::new();
+
+        let rec_opt = execute_hunt_with_notional_cap(
+            &broker,
+            &params,
+            fair_price,
+            &mut trades,
+            &mut fee_tracker,
+            Some(&store),
+            now,
+            HuntTiming::fast_for_tests(),
+            None,
+            hunt_cap,
+            rem_exp,
+        )
+        .await
+        .expect("hunt execution must not error");
+
+        let rec = rec_opt.expect("valid anomaly with >=$500 cap/cash must open hunt");
+        // Theorem 2: strictly passive maker buy price on legal tick grid
+        assert!(rec.buy_price > Decimal::ZERO && rec.buy_price < ask);
+        assert!(is_legal_sec_612_tick(rec.buy_price));
+
+        // Theorem 7.3 cap conservation
+        let buy_notional = rec.buy_qty * rec.buy_price;
+        let eff_cap = hunt_cap.min(rem_exp).min(cash);
+        assert!(
+            buy_notional <= eff_cap && buy_notional >= MIN_ORDER_NOTIONAL_USD,
+            "notional {} violated bounds [$10, {}]",
+            buy_notional,
+            eff_cap
+        );
+
+        // If sell deferred (ExitSubmitPending), verify crash-safe disk pre-persistence & Step A recovery
+        if rec.status == HuntStatus::ExitSubmitPending {
+            let reloaded = store.load_hunts(50);
+            assert_eq!(reloaded.len(), 1);
+            assert_eq!(reloaded[0].status, HuntStatus::ExitSubmitPending);
+            let fair_dec = decimal_from_f64_clean(fair_price).unwrap();
+            let (changed, _) = reconcile_and_maintain_positions(
+                &broker,
+                &params,
+                &mut trades,
+                &mut fee_tracker,
+                fair_dec,
+                bid,
+                now + ChronoDuration::seconds(30),
+                Some(&store),
+                ReconciliationTiming::fast_for_tests(),
+            )
+            .await;
+            assert!(changed);
+            assert_eq!(trades[0].status, HuntStatus::OpenExitPending);
+        }
+
+        // Theorem 1: Simulate exit fill under WORST-CASE 0.25% taker sell fee + 5-fill CFEE split
+        let active_rec = trades[0].clone();
+        assert_eq!(active_rec.status, HuntStatus::OpenExitPending);
+        let sell_oid = active_rec.sell_order_id.clone().unwrap();
+        let exit_px = active_rec.sell_price.unwrap();
+        let sell_qty = active_rec.qty;
+
+        {
+            let mut st = broker.st.lock().unwrap();
+            let ord = st.orders.get_mut(&sell_oid).unwrap();
+            ord.status = "filled".into();
+            ord.filled_qty = sell_qty;
+            ord.filled_avg_price = Some(exit_px);
+            ord.filled_at = Some((now + ChronoDuration::minutes(5)).to_rfc3339());
+            if let Some(ref mut pos) = st.position {
+                pos.qty = (pos.qty - sell_qty).max(Decimal::ZERO);
+                if pos.qty <= Decimal::from_parts(1, 0, 0, false, 7) {
+                    st.position = None;
+                }
+            }
+            // Inject adversarial 5-fill CFEE under worst-case 0.25% taker fee!
+            let worst_cfee =
+                adversarial_multifill_cfee(sell_qty, exit_px, CRYPTO_TIER1_TAKER_FEE_RATE, 5);
+            st.activities.push(AccountActivity {
+                id: format!("cfee-adv-{}", i),
+                activity_type: "CFEE".into(),
+                order_id: Some(sell_oid.clone()),
+                symbol: Some("SOL/USD".into()),
+                transaction_time: Some((now + ChronoDuration::minutes(5)).to_rfc3339()),
+                date: Some("2026-11-25".into()),
+                net_amount: Some(-worst_cfee),
+                qty: None,
+                price: None,
+                description: None,
+                status: Some("executed".into()),
+            });
+        }
+
+        let fair_dec = decimal_from_f64_clean(fair_price).unwrap();
+        reconcile_and_maintain_positions(
+            &broker,
+            &params,
+            &mut trades,
+            &mut fee_tracker,
+            fair_dec,
+            bid,
+            now + ChronoDuration::minutes(5),
+            Some(&store),
+            ReconciliationTiming::fast_for_tests(),
+        )
+        .await;
+
+        assert_eq!(trades[0].status, HuntStatus::Completed);
+        let net_pnl = trades[0].pnl.unwrap();
+        assert!(
+            net_pnl >= d("0.01"),
+            "THEOREM 1 REGRESSION: Completed hunt realized net_pnl={} < $0.01",
+            net_pnl
+        );
+    }
+
+    // 2. Locked / crossed fresh quote must abort cleanly (Theorem 2)
+    {
+        let broker = T7MockBroker::new(T7BrokerState::new(d("100000"), d("75.00"), d("75.00")));
+        let mut trades = Vec::new();
+        let mut fee_tracker = FeeTracker::new();
+        let res = execute_hunt_with_notional_cap(
+            &broker,
+            &params,
+            76.0,
+            &mut trades,
+            &mut fee_tracker,
+            None,
+            now,
+            HuntTiming::fast_for_tests(),
+            None,
+            d("3000"),
+            d("15000"),
+        )
+        .await
+        .unwrap();
+        assert!(res.is_none(), "locked fresh quote must abort hunt");
+    }
+
+    println!(
+        "[THEOREM 7.4 ZERO REGRESSION PROVEN] 40 randomized execute_hunt_with_notional_cap end-to-end runs preserved Theorems 1-6 (strict >=$0.01 net PnL under 0.25% taker + 5-fill CFEE)"
+    );
+}
+
 

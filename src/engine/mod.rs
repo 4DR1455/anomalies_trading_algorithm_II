@@ -3,7 +3,7 @@ pub mod reconciliation;
 
 use crate::alpaca::{AlpacaApi, AlpacaClient, PortfolioHistory};
 use crate::config::{AppConfig, StrategyParams};
-use crate::engine::hunt::{execute_hunt, HuntTiming};
+use crate::engine::hunt::{execute_hunt_with_notional_cap, HuntTiming};
 use crate::engine::reconciliation::{
     build_broker_telemetry, calibrate_fee_tracker_from_sell, reconcile_and_maintain_positions,
     ReconciliationTiming,
@@ -12,9 +12,10 @@ use crate::metrics::{
     compute_performance_metrics, compute_portfolio_history_metrics, PerformanceMetrics,
 };
 use crate::model::{
-    decimal_from_f64_clean, decimal_to_f64, AdaptiveKalmanFilter, FeeTracker, SignalType,
+    decimal_from_f64_clean, decimal_to_f64, AdaptiveKalmanFilter, FeeTracker,
+    RegimeNotionalController, SignalType,
 };
-use crate::state::{trim_hunts_preserving_active, StateStore, TradeRecord};
+use crate::state::{trim_hunts_preserving_active, HuntStatus, StateStore, TradeRecord};
 use crate::telemetry::TelemetrySnapshot;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -60,6 +61,7 @@ pub struct TradingEngine<C: AlpacaApi> {
     params: StrategyParams,
     client: C,
     filter: AdaptiveKalmanFilter,
+    regime_ctrl: RegimeNotionalController,
     store: StateStore,
     fee_tracker: FeeTracker,
     trades_history: Vec<TradeRecord>,
@@ -101,6 +103,7 @@ impl<C: AlpacaApi> TradingEngine<C> {
         let store = StateStore::new(data_dir);
         let trades_history = store.load_hunts(MAX_TERMINAL_HUNTS);
         let initial_kalman = store.load_kalman_state();
+        let initial_regime = store.load_regime_state();
 
         let filter = AdaptiveKalmanFilter::new(
             params.kalman.clone(),
@@ -108,11 +111,14 @@ impl<C: AlpacaApi> TradingEngine<C> {
             params.max_margin,
             initial_kalman,
         );
+        let regime_ctrl =
+            RegimeNotionalController::new(params.regime_sizing.clone(), initial_regime);
 
         Self {
             params,
             client,
             filter,
+            regime_ctrl,
             store,
             fee_tracker: FeeTracker::new(),
             trades_history,
@@ -137,6 +143,14 @@ impl<C: AlpacaApi> TradingEngine<C> {
 
     pub fn filter_mut(&mut self) -> &mut AdaptiveKalmanFilter {
         &mut self.filter
+    }
+
+    pub fn regime_ctrl(&self) -> &RegimeNotionalController {
+        &self.regime_ctrl
+    }
+
+    pub fn regime_ctrl_mut(&mut self) -> &mut RegimeNotionalController {
+        &mut self.regime_ctrl
     }
 
     pub fn store(&self) -> &StateStore {
@@ -365,9 +379,12 @@ impl<C: AlpacaApi> TradingEngine<C> {
     }
 
     fn persist_shutdown_state(&self) {
-        info!("Persisting Kalman state and hunt history before shutdown...");
+        info!("Persisting Kalman state, regime state, and hunt history before shutdown...");
         if let Err(e) = self.store.save_kalman_state(self.filter.state()) {
             error!("Failed to save kalman_state.json on shutdown: {}", e);
+        }
+        if let Err(e) = self.store.save_regime_state(self.regime_ctrl.state()) {
+            error!("Failed to save regime_state.json on shutdown: {}", e);
         }
         if let Err(e) = self
             .store
@@ -406,7 +423,7 @@ impl<C: AlpacaApi> TradingEngine<C> {
             }
         }
 
-        // 2. Fetch live quote & update Adaptive 1D Kalman Filter
+        // 2. Fetch live quote & update Adaptive 1D Kalman Filter + Regime Notional Controller
         let quote = self
             .client
             .get_latest_quote(&symbol)
@@ -426,12 +443,19 @@ impl<C: AlpacaApi> TradingEngine<C> {
         } else {
             0.5 * (bid_f + ask_f)
         };
+        self.regime_ctrl.update(ku.market_mid);
 
         if let Err(e) = self.store.save_kalman_state(self.filter.state()) {
             warn!("Failed to persist kalman_state.json: {}", e);
         }
 
         // 3. Full Broker Reconciliation, Exit Monitoring, 12h Stale Liquidation, Adoption & Orphan Protection
+        let stale_before = self
+            .trades_history
+            .iter()
+            .filter(|h| h.status == HuntStatus::LiquidatedStale)
+            .count();
+
         let (pending_updated, mut broker_telemetry) = reconcile_and_maintain_positions(
             &self.client,
             &self.params,
@@ -445,6 +469,18 @@ impl<C: AlpacaApi> TradingEngine<C> {
         )
         .await;
 
+        let stale_after = self
+            .trades_history
+            .iter()
+            .filter(|h| h.status == HuntStatus::LiquidatedStale)
+            .count();
+        if stale_after > stale_before {
+            self.regime_ctrl.on_stale_liquidation();
+        }
+        if let Err(e) = self.store.save_regime_state(self.regime_ctrl.state()) {
+            warn!("Failed to persist regime_state.json: {}", e);
+        }
+
         if pending_updated {
             self.trades_history =
                 trim_hunts_preserving_active(&self.trades_history, MAX_TERMINAL_HUNTS);
@@ -456,8 +492,49 @@ impl<C: AlpacaApi> TradingEngine<C> {
             }
         }
 
+        let hunt_cap_usd = self.regime_ctrl.current_hunt_cap_usd();
+        let total_exposure_cap_usd = self.regime_ctrl.current_total_exposure_cap_usd();
+        let mid_dec = if bid_d > Decimal::ZERO && ask_d > Decimal::ZERO {
+            (bid_d + ask_d) / Decimal::TWO
+        } else {
+            decimal_from_f64_clean(mid_f)
+                .filter(|d| *d > Decimal::ZERO)
+                .unwrap_or(Decimal::ZERO)
+        };
+        let tracked_exposure_usd: Decimal = self
+            .trades_history
+            .iter()
+            .filter(|h| h.status.is_active())
+            .fold(Decimal::ZERO, |acc, h| {
+                let rem = (h.qty - h.filled_exit_qty).max(Decimal::ZERO);
+                let mark = h.buy_price.max(mid_dec);
+                let notional = rem.checked_mul(mark).unwrap_or(Decimal::MAX);
+                acc.saturating_add(notional)
+            });
+        let broker_qty_dec = decimal_from_f64_clean(broker_telemetry.broker_position.qty)
+            .filter(|d| *d > Decimal::ZERO)
+            .unwrap_or(Decimal::ZERO);
+        let broker_avg_entry_dec =
+            decimal_from_f64_clean(broker_telemetry.broker_position.avg_entry_price)
+                .filter(|d| *d > Decimal::ZERO)
+                .unwrap_or(Decimal::ZERO);
+        let broker_cur_px_dec =
+            decimal_from_f64_clean(broker_telemetry.broker_position.current_price)
+                .filter(|d| *d > Decimal::ZERO)
+                .unwrap_or(Decimal::ZERO);
+        let broker_mark_px = broker_avg_entry_dec
+            .max(bid_d.max(Decimal::ZERO))
+            .max(broker_cur_px_dec);
+        let broker_exposure_usd = broker_qty_dec
+            .checked_mul(broker_mark_px)
+            .unwrap_or(Decimal::MAX);
+        let active_exposure_usd = tracked_exposure_usd.max(broker_exposure_usd);
+        let remaining_exposure_usd = total_exposure_cap_usd
+            .saturating_sub(active_exposure_usd)
+            .max(Decimal::ZERO);
+
         info!(
-            "[{}] Bid=${:.2} Ask=${:.2} | Kalman=${:.2} | Margin={:+.4}% | Pos={:.4} ({})",
+            "[{}] Bid=${:.2} Ask=${:.2} | Kalman=${:.2} | Margin={:+.4}% | Pos={:.4} ({}) | Cap=${}/${}",
             now_dt.format("%Y-%m-%d %H:%M:%S"),
             bid_f,
             ask_f,
@@ -468,7 +545,9 @@ impl<C: AlpacaApi> TradingEngine<C> {
                 "SYNCED".to_string()
             } else {
                 format!("DRIFT={:+.4}", broker_telemetry.reconciliation.untracked_qty)
-            }
+            },
+            hunt_cap_usd.round_dp(0),
+            total_exposure_cap_usd.round_dp(0)
         );
 
         // 4. Process Kalman Signal
@@ -501,7 +580,7 @@ impl<C: AlpacaApi> TradingEngine<C> {
                     market_mid
                 );
 
-                match execute_hunt(
+                match execute_hunt_with_notional_cap(
                     &self.client,
                     &self.params,
                     *fair_price,
@@ -511,6 +590,8 @@ impl<C: AlpacaApi> TradingEngine<C> {
                     now_dt,
                     self.timing.hunt,
                     shutdown_flag,
+                    hunt_cap_usd,
+                    remaining_exposure_usd,
                 )
                 .await
                 {

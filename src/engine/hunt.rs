@@ -7,9 +7,10 @@ use crate::engine::reconciliation::{
 };
 use crate::model::{
     calculate_dynamic_portfolio_shares, calculate_hidden_mm_buy_price,
-    compute_guaranteed_profitable_exit_price, compute_net_trade_pnl, decimal_from_f64_clean,
-    decimal_to_f64, floor_qty, format_order_qty, format_tick_price, FeeTracker,
-    CFEE_CEIL_BUFFER_USD, MIN_NET_PROFIT_MARGIN,
+    calculate_notional_capped_shares, compute_guaranteed_profitable_exit_price,
+    compute_net_trade_pnl, decimal_from_f64_clean, decimal_to_f64, floor_qty, format_order_qty,
+    format_tick_price, FeeTracker, CFEE_CEIL_BUFFER_USD, MIN_NET_PROFIT_MARGIN,
+    MIN_ORDER_NOTIONAL_USD,
 };
 use crate::state::{HuntStatus, StateStore, TradeRecord};
 use chrono::{DateTime, Utc};
@@ -57,18 +58,17 @@ impl HuntTiming {
     }
 }
 
-/// Executes a complete, crash-safe, fee-aware Market Hunt:
-/// 1. Fetches a **fresh** quote immediately before sizing & order submission to prevent stale-quote crossing.
-/// 2. Computes strictly passive `buy_price = calculate_hidden_mm_buy_price(fresh_bid, fresh_ask)`.
-/// 3. Re-verifies executable margin `(fair_price - buy_price) / fair_price >= min_margin` (and `<= max_margin`).
-/// 4. Sizes via `calculate_dynamic_portfolio_shares` (`qty * buy_price <= cash`), submits passive limit BUY,
-///    polls up to `hidden_mm_timeout_seconds`, cancels remainder if open, and waits for strictly terminal state.
-/// 5. On fill (`filled_qty > 0`):
-///    - Calls `compute_safe_exit_sell_qty` FIRST to learn exact net credited balance.
-///    - Calibrates `FeeTracker` from realized buy-fee delta (`1 - net_qty / buy_qty`).
-///    - Computes `exit_price = compute_guaranteed_profitable_exit_price(...)`.
-///    - Persists `TradeRecord` (`ExitSubmitPending`) atomically to disk BEFORE calling `submit_exit_sell_with_retry`.
-///    - Finalizes to `Completed` (fetching actual `CFEE`) if immediately filled, else `OpenExitPending`.
+#[derive(Debug, Clone, Copy)]
+enum HuntSizingMode {
+    DynamicPortfolio,
+    FixedNotionalCap {
+        hunt_cap_usd: Decimal,
+        remaining_exposure_usd: Decimal,
+    },
+}
+
+/// Executes a complete, crash-safe, fee-aware Market Hunt using `calculate_dynamic_portfolio_shares`.
+/// Preserved with its 9-argument signature for full backward compatibility.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_hunt<C: AlpacaApi>(
     client: &C,
@@ -81,10 +81,102 @@ pub async fn execute_hunt<C: AlpacaApi>(
     timing: HuntTiming,
     shutdown_flag: Option<&AtomicBool>,
 ) -> Result<Option<TradeRecord>, String> {
+    execute_hunt_inner(
+        client,
+        params,
+        fair_price_f64,
+        trades_history,
+        fee_tracker,
+        store,
+        now_dt,
+        timing,
+        shutdown_flag,
+        HuntSizingMode::DynamicPortfolio,
+    )
+    .await
+}
+
+/// Executes a complete, crash-safe, fee-aware Market Hunt using fixed-USD regime notional caps
+/// (`calculate_notional_capped_shares`) constrained by both `hunt_cap_usd` and `remaining_exposure_usd`.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_hunt_with_notional_cap<C: AlpacaApi>(
+    client: &C,
+    params: &StrategyParams,
+    fair_price_f64: f64,
+    trades_history: &mut Vec<TradeRecord>,
+    fee_tracker: &mut FeeTracker,
+    store: Option<&StateStore>,
+    now_dt: DateTime<Utc>,
+    timing: HuntTiming,
+    shutdown_flag: Option<&AtomicBool>,
+    hunt_cap_usd: Decimal,
+    remaining_exposure_usd: Decimal,
+) -> Result<Option<TradeRecord>, String> {
+    execute_hunt_inner(
+        client,
+        params,
+        fair_price_f64,
+        trades_history,
+        fee_tracker,
+        store,
+        now_dt,
+        timing,
+        shutdown_flag,
+        HuntSizingMode::FixedNotionalCap {
+            hunt_cap_usd,
+            remaining_exposure_usd,
+        },
+    )
+    .await
+}
+
+/// Shared crash-safe HiddenMM Market Hunt implementation:
+/// 1. Fetches a **fresh** quote immediately before sizing & order submission to prevent stale-quote crossing.
+/// 2. Computes strictly passive `buy_price = calculate_hidden_mm_buy_price(fresh_bid, fresh_ask)`.
+/// 3. Re-verifies executable margin `(fair_price - buy_price) / fair_price >= min_margin` (and `<= max_margin`).
+/// 4. Sizes via `HuntSizingMode` (`qty * buy_price <= min(cap, cash)`), submits passive limit BUY,
+///    polls up to `hidden_mm_timeout_seconds`, cancels remainder if open, and waits for strictly terminal state.
+/// 5. On fill (`filled_qty > 0`):
+///    - Calls `compute_safe_exit_sell_qty` FIRST to learn exact net credited balance.
+///    - Calibrates `FeeTracker` from realized buy-fee delta (`1 - net_qty / buy_qty`).
+///    - Computes `exit_price = compute_guaranteed_profitable_exit_price(...)`.
+///    - Persists `TradeRecord` (`ExitSubmitPending`) atomically to disk BEFORE calling `submit_exit_sell_with_retry`.
+///    - Finalizes to `Completed` (fetching actual `CFEE`) if immediately filled, else `OpenExitPending`.
+#[allow(clippy::too_many_arguments)]
+async fn execute_hunt_inner<C: AlpacaApi>(
+    client: &C,
+    params: &StrategyParams,
+    fair_price_f64: f64,
+    trades_history: &mut Vec<TradeRecord>,
+    fee_tracker: &mut FeeTracker,
+    store: Option<&StateStore>,
+    now_dt: DateTime<Utc>,
+    timing: HuntTiming,
+    shutdown_flag: Option<&AtomicBool>,
+    sizing_mode: HuntSizingMode,
+) -> Result<Option<TradeRecord>, String> {
     let Some(fair_price) = decimal_from_f64_clean(fair_price_f64).filter(|d| *d > Decimal::ZERO)
     else {
         return Ok(None);
     };
+
+    if let HuntSizingMode::FixedNotionalCap {
+        hunt_cap_usd,
+        remaining_exposure_usd,
+    } = sizing_mode
+    {
+        if hunt_cap_usd < MIN_ORDER_NOTIONAL_USD
+            || remaining_exposure_usd < MIN_ORDER_NOTIONAL_USD
+        {
+            info!(
+                "Skipping hunt on {}: exposure/cap budget below minimum notional (hunt_cap=${}, remaining_exposure=${})",
+                params.symbol,
+                hunt_cap_usd.round_dp(2),
+                remaining_exposure_usd.round_dp(2)
+            );
+            return Ok(None);
+        }
+    }
 
     let symbol = params.symbol.as_str();
     let is_crypto = params.is_crypto();
@@ -154,18 +246,34 @@ pub async fn execute_hunt<C: AlpacaApi>(
         }
     };
 
-    // 5. Dynamic portfolio sizing with strict cash-cap invariant (qty * buy_price <= cash)
-    let shares = calculate_dynamic_portfolio_shares(
-        exec_margin_f64,
-        params.min_margin,
-        params.max_margin,
-        params.level,
-        params.max_shares_decimal(),
-        equity,
-        cash,
-        buy_price,
-        is_crypto,
-    );
+    // 5. Position sizing with strict cash & cap invariants
+    let shares = match sizing_mode {
+        HuntSizingMode::DynamicPortfolio => calculate_dynamic_portfolio_shares(
+            exec_margin_f64,
+            params.min_margin,
+            params.max_margin,
+            params.level,
+            params.max_shares_decimal(),
+            equity,
+            cash,
+            buy_price,
+            is_crypto,
+        ),
+        HuntSizingMode::FixedNotionalCap {
+            hunt_cap_usd,
+            remaining_exposure_usd,
+        } => calculate_notional_capped_shares(
+            exec_margin_f64,
+            params.min_margin,
+            params.max_margin,
+            params.level,
+            hunt_cap_usd,
+            remaining_exposure_usd,
+            cash,
+            buy_price,
+            is_crypto,
+        ),
+    };
 
     if shares <= Decimal::ZERO {
         info!(

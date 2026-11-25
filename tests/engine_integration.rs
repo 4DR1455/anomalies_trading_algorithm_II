@@ -3,7 +3,7 @@ use anomalies_trading_engine::alpaca::{
     Account, AccountActivity, AlpacaApi, AlpacaError, Order, OrderRequest, PortfolioHistory,
     Position, QuoteDetail,
 };
-use anomalies_trading_engine::config::{KalmanParams, StrategyParams};
+use anomalies_trading_engine::config::{KalmanParams, RegimeSizingParams, StrategyParams};
 use anomalies_trading_engine::engine::hunt::{execute_hunt, HuntTiming};
 use anomalies_trading_engine::engine::reconciliation::{
     fetch_actual_cfee_usd, reconcile_and_maintain_positions, ReconciliationTiming,
@@ -44,6 +44,7 @@ fn default_sol_params() -> StrategyParams {
             spread_weight: 2.0,
             adapt_lambda: 0.20,
         },
+        regime_sizing: RegimeSizingParams::default(),
     }
 }
 
@@ -2229,3 +2230,201 @@ async fn test_bonus11_cfee_pagination_over_100_partial_fills() {
         .expect("must sum across all 3 pages");
     assert_eq!(total_cfee, d("2.50"));
 }
+
+/// Test 13: End-to-end fixed-USD dynamic regime sizing (`$3,000 <-> $30,000`), concurrent exposure cap,
+/// instant drop to `$3,000` on `LiquidatedStale`, and crash-safe `regime_state.json` persistence.
+#[tokio::test]
+async fn test_regime_sizing_bear_bull_exposure_cap_and_stale_drop() {
+    let tmp = tempdir().unwrap();
+    let mut params = default_sol_params();
+    params.regime_sizing = RegimeSizingParams {
+        min_notional_usd: 3000.0,
+        max_notional_usd: 30000.0,
+        min_total_exposure_usd: 15000.0,
+        max_total_exposure_usd: 45000.0,
+        ema_fast_cycles: 4,
+        ema_slow_cycles: 20,
+        vol_cycles: 4,
+        sigmoid_k: 2.0,
+        sigmoid_center: 0.25,
+        ramp_up_alpha: 0.5,
+        stale_cooldown_cycles: 10,
+    };
+
+    let mock = MockAlpacaClient::new(MockBrokerState {
+        account: Account {
+            equity: d("1000000.00"),
+            cash: d("1000000.00"),
+            buying_power: d("1000000.00"),
+            non_marginable_buying_power: Some(d("1000000.00")),
+        },
+        market_sell_fill_price: d("110.00"),
+        ..Default::default()
+    });
+
+    let push_quote = |bid: Decimal, count: usize| {
+        let mut st = mock.state.lock().unwrap();
+        for _ in 0..count {
+            st.quote_queue.push_back(QuoteDetail {
+                timestamp: Some("2026-11-24T10:00:00Z".into()),
+                bid_price: bid,
+                ask_price: bid + d("0.02"),
+                bid_size: Some(d("10000")),
+                ask_size: Some(d("10000")),
+            });
+        }
+    };
+
+    let mut engine = TradingEngine::with_client_and_timing(
+        params.clone(),
+        tmp.path(),
+        mock.clone(),
+        EngineTiming::fast_for_tests(),
+    );
+    engine.initialize().await;
+
+    let base_time = DateTime::parse_from_rfc3339("2026-11-24T10:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut step = 0i64;
+    let mut next_ts = || {
+        step += 1;
+        base_time + ChronoDuration::seconds(30 * step)
+    };
+
+    // 1. Warmup / Bear regime -> strictly capped at $3,000 despite $1,000,000 cash
+    push_quote(d("100.00"), 3);
+    for _ in 0..3 {
+        engine.step_cycle_at(next_ts(), None).await.unwrap();
+    }
+    assert_eq!(engine.regime_ctrl().current_hunt_cap_usd(), d("3000"));
+
+    push_quote(d("99.00"), 2);
+    let bear_snap = engine.step_cycle_at(next_ts(), None).await.unwrap();
+    assert_eq!(bear_snap.active_hunts_count, 1);
+    let h1 = engine.trades_history()[0].clone();
+    let h1_notional = h1.buy_qty * h1.buy_price;
+    assert!(
+        h1_notional <= d("3000") && h1_notional >= d("2950"),
+        "bear/warmup hunt notional {} must respect $3,000 floor cap",
+        h1_notional
+    );
+
+    // Close Hunt #1 cleanly so Phase 2 starts with zero active exposure
+    mock.fill_sell_order(
+        h1.sell_order_id.as_deref().unwrap(),
+        None,
+        CRYPTO_TIER1_MAKER_FEE_RATE,
+        false,
+    );
+    push_quote(d("100.00"), 1);
+    let closed_snap = engine.step_cycle_at(next_ts(), None).await.unwrap();
+    assert_eq!(closed_snap.active_hunts_count, 0);
+
+    // 2. Sustained bull uptrend -> ramps hunt cap toward $30,000 and total exposure cap toward $45,000
+    for i in 1..=30 {
+        let bid = d("100.00") + Decimal::new(i * 50, 2);
+        push_quote(bid, 1);
+        engine.step_cycle_at(next_ts(), None).await.unwrap();
+    }
+    let bull_cap = engine.regime_ctrl().current_hunt_cap_usd();
+    let bull_exp_cap = engine.regime_ctrl().current_total_exposure_cap_usd();
+    assert!(
+        bull_cap >= d("29500") && bull_cap <= d("30000"),
+        "bull cap {} should ramp close to $30,000",
+        bull_cap
+    );
+    assert!(
+        bull_exp_cap >= d("44500") && bull_exp_cap <= d("45000"),
+        "bull total exposure cap {} should ramp close to $45,000",
+        bull_exp_cap
+    );
+
+    // Trigger 1st bull anomaly (~1% dip below Kalman fair price) -> opens ~$30k hunt
+    let dip_bid_1 = floor_qty(
+        Decimal::from_f64_retain(engine.filter().state().x_hat * 0.99).unwrap(),
+        2,
+    );
+    push_quote(dip_bid_1, 2);
+    let bull_snap_1 = engine.step_cycle_at(next_ts(), None).await.unwrap();
+    assert_eq!(bull_snap_1.active_hunts_count, 1);
+    let h2 = engine.trades_history().last().unwrap().clone();
+    let h2_notional = h2.buy_qty * h2.buy_price;
+    assert!(
+        h2_notional > d("25000") && h2_notional <= d("30000"),
+        "bull hunt notional {} must scale up to ~$30,000 cap",
+        h2_notional
+    );
+
+    // Trigger 2nd bull anomaly -> strictly capped by remaining concurrent exposure (~$15,000)
+    let dip_bid_2 = floor_qty(
+        Decimal::from_f64_retain(engine.filter().state().x_hat * 0.99).unwrap(),
+        2,
+    );
+    push_quote(dip_bid_2, 2);
+    let bull_snap_2 = engine.step_cycle_at(next_ts(), None).await.unwrap();
+    assert_eq!(bull_snap_2.active_hunts_count, 2);
+    let h3 = engine.trades_history().last().unwrap().clone();
+    let h3_notional = h3.buy_qty * h3.buy_price;
+    assert!(
+        h3_notional <= d("16000") && h3_notional > d("1000"),
+        "second concurrent bull hunt {} must be capped by remaining exposure budget",
+        h3_notional
+    );
+    let active_exposure: Decimal = engine
+        .trades_history()
+        .iter()
+        .filter(|h| h.status.is_active())
+        .map(|h| (h.qty - h.filled_exit_qty).max(Decimal::ZERO) * h.buy_price)
+        .sum();
+    assert!(
+        active_exposure <= d("45000"),
+        "active exposure {} exceeded max_total_exposure_usd $45,000",
+        active_exposure
+    );
+
+    // 3rd dip when concurrent exposure cap is saturated -> ZERO additional hunt opened
+    let dip_bid_3 = floor_qty(
+        Decimal::from_f64_retain(engine.filter().state().x_hat * 0.99).unwrap(),
+        2,
+    );
+    push_quote(dip_bid_3, 2);
+    let capped_snap = engine.step_cycle_at(next_ts(), None).await.unwrap();
+    assert_eq!(
+        capped_snap.active_hunts_count, 2,
+        "exposure cap saturation must block a 3rd concurrent hunt"
+    );
+
+    // 3. Advance +13h -> stale liquidation triggers LiquidatedStale & instant clamp to $3,000
+    push_quote(d("110.00"), 1);
+    let stale_snap = engine
+        .step_cycle_at(base_time + ChronoDuration::hours(13), None)
+        .await
+        .unwrap();
+    assert_eq!(stale_snap.active_hunts_count, 0);
+    assert!(
+        engine
+            .trades_history()
+            .iter()
+            .any(|h| h.status == HuntStatus::LiquidatedStale),
+        "expected stale liquidation"
+    );
+    assert_eq!(engine.regime_ctrl().current_hunt_cap_usd(), d("3000"));
+    assert_eq!(
+        engine.regime_ctrl().current_total_exposure_cap_usd(),
+        d("15000")
+    );
+    assert_eq!(engine.regime_ctrl().state().stale_cooldown_remaining, 10);
+
+    // Verify regime_state.json persists across engine restart
+    assert!(tmp.path().join("regime_state.json").exists());
+    let reloaded = TradingEngine::with_client_and_timing(
+        params,
+        tmp.path(),
+        mock,
+        EngineTiming::fast_for_tests(),
+    );
+    assert_eq!(reloaded.regime_ctrl().current_hunt_cap_usd(), d("3000"));
+    assert_eq!(reloaded.regime_ctrl().state().stale_cooldown_remaining, 10);
+}
+

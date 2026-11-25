@@ -12,6 +12,40 @@ pub struct KalmanParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RegimeSizingParams {
+    pub min_notional_usd: f64,
+    pub max_notional_usd: f64,
+    pub min_total_exposure_usd: f64,
+    pub max_total_exposure_usd: f64,
+    pub ema_fast_cycles: u64,
+    pub ema_slow_cycles: u64,
+    pub vol_cycles: u64,
+    pub sigmoid_k: f64,
+    pub sigmoid_center: f64,
+    pub ramp_up_alpha: f64,
+    pub stale_cooldown_cycles: u64,
+}
+
+impl Default for RegimeSizingParams {
+    fn default() -> Self {
+        Self {
+            min_notional_usd: 3000.0,
+            max_notional_usd: 30000.0,
+            min_total_exposure_usd: 15000.0,
+            max_total_exposure_usd: 90000.0,
+            ema_fast_cycles: 720,
+            ema_slow_cycles: 5760,
+            vol_cycles: 720,
+            sigmoid_k: 2.0,
+            sigmoid_center: 0.25,
+            ramp_up_alpha: 0.01,
+            stale_cooldown_cycles: 1440,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyParams {
     pub symbol: String,
     pub level: f64,
@@ -27,6 +61,8 @@ pub struct StrategyParams {
     #[serde(default)]
     pub backfill_closed_orders: bool,
     pub kalman: KalmanParams,
+    #[serde(default)]
+    pub regime_sizing: RegimeSizingParams,
 }
 
 impl StrategyParams {
@@ -143,6 +179,54 @@ impl AppConfig {
         }
         if !params.kalman.adapt_lambda.is_finite() || params.kalman.adapt_lambda <= 0.0 {
             return Err("kalman.adapt_lambda must be finite and strictly positive".to_string());
+        }
+        let rs = &params.regime_sizing;
+        if !rs.min_notional_usd.is_finite() || rs.min_notional_usd < 10.0 {
+            return Err(
+                "regime_sizing.min_notional_usd must be finite and >= 10.0".to_string(),
+            );
+        }
+        if !rs.max_notional_usd.is_finite() || rs.max_notional_usd < rs.min_notional_usd {
+            return Err(
+                "regime_sizing.max_notional_usd must be finite and >= min_notional_usd".to_string(),
+            );
+        }
+        if !rs.min_total_exposure_usd.is_finite()
+            || rs.min_total_exposure_usd < rs.min_notional_usd
+        {
+            return Err(
+                "regime_sizing.min_total_exposure_usd must be finite and >= min_notional_usd"
+                    .to_string(),
+            );
+        }
+        if !rs.max_total_exposure_usd.is_finite()
+            || rs.max_total_exposure_usd < rs.min_total_exposure_usd
+            || rs.max_total_exposure_usd < rs.max_notional_usd
+        {
+            return Err(
+                "regime_sizing.max_total_exposure_usd must be finite, >= min_total_exposure_usd, and >= max_notional_usd"
+                    .to_string(),
+            );
+        }
+        if rs.ema_fast_cycles < 1 {
+            return Err("regime_sizing.ema_fast_cycles must be >= 1".to_string());
+        }
+        if rs.ema_slow_cycles <= rs.ema_fast_cycles {
+            return Err("regime_sizing.ema_slow_cycles must be > ema_fast_cycles".to_string());
+        }
+        if rs.vol_cycles < 1 {
+            return Err("regime_sizing.vol_cycles must be >= 1".to_string());
+        }
+        if !rs.sigmoid_k.is_finite() || rs.sigmoid_k <= 0.0 {
+            return Err("regime_sizing.sigmoid_k must be finite and > 0.0".to_string());
+        }
+        if !rs.sigmoid_center.is_finite() {
+            return Err("regime_sizing.sigmoid_center must be finite".to_string());
+        }
+        if !rs.ramp_up_alpha.is_finite() || rs.ramp_up_alpha <= 0.0 || rs.ramp_up_alpha > 1.0 {
+            return Err(
+                "regime_sizing.ramp_up_alpha must be finite and in (0.0, 1.0]".to_string(),
+            );
         }
         Ok(())
     }
@@ -296,5 +380,55 @@ Secret: abcdef123==
         assert_eq!(creds.endpoint, "https://paper-api.alpaca.markets/v2");
         assert_eq!(creds.key, "PKCOLON123");
         assert_eq!(creds.secret, "abcdef123==");
+    }
+
+    #[test]
+    fn test_regime_sizing_params_validation_and_defaults() {
+        let json_without_regime = r#"{
+            "symbol": "SOL/USD",
+            "level": 0.05,
+            "max_shares": 0.02,
+            "min_margin": 0.0036,
+            "max_margin": 0.0250,
+            "kalman": { "q_base": 1.5e-7, "r_base": 4.0e-7, "spread_weight": 2.0, "adapt_lambda": 0.20 }
+        }"#;
+        let base: StrategyParams = serde_json::from_str(json_without_regime).unwrap();
+        assert_eq!(base.regime_sizing.min_notional_usd, 3000.0);
+        assert_eq!(base.regime_sizing.max_notional_usd, 30000.0);
+        assert_eq!(base.regime_sizing.min_total_exposure_usd, 15000.0);
+        assert_eq!(base.regime_sizing.max_total_exposure_usd, 90000.0);
+        assert!(AppConfig::validate_params(&base).is_ok());
+
+        let prod_params: StrategyParams =
+            serde_json::from_str(include_str!("../params.json")).unwrap();
+        assert!(AppConfig::validate_params(&prod_params).is_ok());
+
+        let mut bad = base.clone();
+        bad.regime_sizing.min_notional_usd = 9.99;
+        assert!(AppConfig::validate_params(&bad).is_err());
+
+        let mut bad = base.clone();
+        bad.regime_sizing.max_notional_usd = 2999.0;
+        assert!(AppConfig::validate_params(&bad).is_err());
+
+        let mut bad = base.clone();
+        bad.regime_sizing.min_total_exposure_usd = 2999.0;
+        assert!(AppConfig::validate_params(&bad).is_err());
+
+        let mut bad = base.clone();
+        bad.regime_sizing.max_total_exposure_usd = 14999.0;
+        assert!(AppConfig::validate_params(&bad).is_err());
+
+        let mut bad = base.clone();
+        bad.regime_sizing.ema_slow_cycles = bad.regime_sizing.ema_fast_cycles;
+        assert!(AppConfig::validate_params(&bad).is_err());
+
+        let mut bad = base.clone();
+        bad.regime_sizing.sigmoid_k = 0.0;
+        assert!(AppConfig::validate_params(&bad).is_err());
+
+        let mut bad = base;
+        bad.regime_sizing.ramp_up_alpha = 0.0;
+        assert!(AppConfig::validate_params(&bad).is_err());
     }
 }

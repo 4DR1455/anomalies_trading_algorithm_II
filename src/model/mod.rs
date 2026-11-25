@@ -12,4 +12,7 @@ pub use pricing::{
     CRYPTO_TIER1_TAKER_FEE_RATE, HALF_CENT_USD, MIN_NET_PROFIT_MARGIN, MIN_ORDER_NOTIONAL_USD,
     MIN_PROTECT_NOTIONAL_USD,
 };
-pub use sizing::calculate_dynamic_portfolio_shares;
+pub use sizing::{
+    calculate_dynamic_portfolio_shares, calculate_notional_capped_shares, RegimeNotionalController,
+    RegimeNotionalState,
+};

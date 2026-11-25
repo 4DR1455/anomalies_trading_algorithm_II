@@ -2,7 +2,7 @@ use crate::model::pricing::serde_decimal::{
     deserialize_decimal_or_zero, deserialize_opt_decimal, serialize_decimal_as_f64,
     serialize_opt_decimal_as_f64,
 };
-use crate::model::KalmanState;
+use crate::model::{KalmanState, RegimeNotionalState};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -225,7 +225,8 @@ pub fn atomic_write_json<T: Serialize>(path: &Path, data: &T) -> Result<(), Stri
     Ok(())
 }
 
-/// Crash-safe persistent store for `hunts_history.json`, `metrics.json`, `telemetry.json`, and `kalman_state.json`.
+/// Crash-safe persistent store for `hunts_history.json`, `metrics.json`, `telemetry.json`,
+/// `kalman_state.json`, and `regime_state.json`.
 #[derive(Debug, Clone)]
 pub struct StateStore {
     data_dir: PathBuf,
@@ -233,6 +234,34 @@ pub struct StateStore {
     metrics_path: PathBuf,
     telemetry_path: PathBuf,
     kalman_path: PathBuf,
+    regime_path: PathBuf,
+}
+
+fn load_validated_json<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    is_valid: fn(&T) -> bool,
+    label: &str,
+) -> Option<T> {
+    if !path.exists() {
+        return None;
+    }
+    match fs::read_to_string(path) {
+        Ok(content) => match serde_json::from_str::<T>(&content) {
+            Ok(state) if is_valid(&state) => Some(state),
+            Ok(_) => {
+                warn!("Ignoring invalid/corrupted {} state in {:?}", label, path);
+                None
+            }
+            Err(e) => {
+                warn!("Failed to parse {:?}: {}", path, e);
+                None
+            }
+        },
+        Err(e) => {
+            warn!("Failed to read {:?}: {}", path, e);
+            None
+        }
+    }
 }
 
 impl StateStore {
@@ -246,6 +275,7 @@ impl StateStore {
             metrics_path: dir.join("metrics.json"),
             telemetry_path: dir.join("telemetry.json"),
             kalman_path: dir.join("kalman_state.json"),
+            regime_path: dir.join("regime_state.json"),
             data_dir: dir,
         }
     }
@@ -268,6 +298,10 @@ impl StateStore {
 
     pub fn kalman_path(&self) -> &Path {
         &self.kalman_path
+    }
+
+    pub fn regime_path(&self) -> &Path {
+        &self.regime_path
     }
 
     /// Loads hunts from `hunts_history.json` (or falls back to `telemetry.json`'s `trades` array).
@@ -318,30 +352,19 @@ impl StateStore {
     }
 
     pub fn load_kalman_state(&self) -> Option<KalmanState> {
-        if !self.kalman_path.exists() {
-            return None;
-        }
-        match fs::read_to_string(&self.kalman_path) {
-            Ok(content) => match serde_json::from_str::<KalmanState>(&content) {
-                Ok(state) if state.is_valid() => Some(state),
-                Ok(_) => {
-                    warn!("Ignoring invalid/corrupted Kalman state in {:?}", self.kalman_path);
-                    None
-                }
-                Err(e) => {
-                    warn!("Failed to parse {:?}: {}", self.kalman_path, e);
-                    None
-                }
-            },
-            Err(e) => {
-                warn!("Failed to read {:?}: {}", self.kalman_path, e);
-                None
-            }
-        }
+        load_validated_json(&self.kalman_path, KalmanState::is_valid, "Kalman")
     }
 
     pub fn save_kalman_state(&self, state: &KalmanState) -> Result<(), String> {
         atomic_write_json(&self.kalman_path, state)
+    }
+
+    pub fn load_regime_state(&self) -> Option<RegimeNotionalState> {
+        load_validated_json(&self.regime_path, RegimeNotionalState::is_valid, "regime")
+    }
+
+    pub fn save_regime_state(&self, state: &RegimeNotionalState) -> Result<(), String> {
+        atomic_write_json(&self.regime_path, state)
     }
 
     pub fn save_metrics<T: Serialize>(&self, metrics: &T) -> Result<(), String> {

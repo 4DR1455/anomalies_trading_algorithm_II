@@ -12,5 +12,18 @@
     "r_base": 4.0e-7,
     "spread_weight": 2.0,
     "adapt_lambda": 0.20
+  },
+  "regime_sizing": {
+    "min_notional_usd": 3000.0,
+    "max_notional_usd": 30000.0,
+    "min_total_exposure_usd": 15000.0,
+    "max_total_exposure_usd": 90000.0,
+    "ema_fast_cycles": 720,
+    "ema_slow_cycles": 5760,
+    "vol_cycles": 720,
+    "sigmoid_k": 2.0,
+    "sigmoid_center": 0.25,
+    "ramp_up_alpha": 0.01,
+    "stale_cooldown_cycles": 1440
   }
 }

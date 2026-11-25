@@ -23,6 +23,7 @@ data/metrics.json
 data/hunts_history.json
 data/state.json
 data/kalman_state.json
+data/regime_state.json
 data/*.tmp
 data/*.json.tmp
 

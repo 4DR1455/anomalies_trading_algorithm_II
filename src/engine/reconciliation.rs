@@ -1663,8 +1663,15 @@ pub async fn reconcile_and_maintain_positions<C: AlpacaApi>(
                 buy_qty: o_qty,
                 qty: o_qty,
                 filled_exit_qty: o_filled,
-                buy_price: avg_entry_ref
-                    .round_dp_with_strategy(4, RoundingStrategy::MidpointNearestEven),
+                buy_price: {
+                    let rounded = avg_entry_ref
+                        .round_dp_with_strategy(4, RoundingStrategy::MidpointNearestEven);
+                    if rounded > Decimal::ZERO {
+                        rounded
+                    } else {
+                        avg_entry_ref
+                    }
+                },
                 sell_price: Some(confirmed_limit),
                 pnl: None,
                 pnl_pct: None,
